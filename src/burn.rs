@@ -33,11 +33,9 @@ pub struct BondJsolChange {
 pub struct BondHistory {
     /// Successful transactions inside the window, newest first.
     pub changes: Vec<BondJsolChange>,
-    /// True when a transaction older than the window start exists, so the
-    /// window is fully covered by history.
-    pub covers_window: bool,
-    /// Block time of the oldest transaction seen inside the window.
-    pub oldest_in_window: Option<i64>,
+    /// The newest successful transaction before the window start was a
+    /// claim: claiming was already under way, so the window is full.
+    pub claim_before_window: bool,
 }
 
 impl BondHistory {
@@ -73,10 +71,13 @@ impl BurnEstimate {
     }
 }
 
-/// Sums JSOL decreases over the span from the window start (or the first
-/// observed transaction, when history is shorter) to now, and converts the
-/// per-day rate to SOL with `jsol_to_lamports`. With less than
-/// `min_span_seconds` of history the fallback rate is used.
+/// Sums the JSOL decreases (claims) inside the window and divides by the
+/// span from the first claim to now, so quiet history before claims started
+/// does not dilute the rate (slightly overestimating it, the safe side).
+/// When claims already ran before the window, the span is the full window.
+/// Fewer than two claims, or less than `min_span_seconds` since the first
+/// one, fall back to `fallback_lamports_per_day`. The per-day JSOL is
+/// converted to SOL with `jsol_to_lamports`.
 pub fn estimate_burn(
     history: &BondHistory,
     window_start: i64,
@@ -87,31 +88,39 @@ pub fn estimate_burn(
 ) -> Result<BurnEstimate> {
     let mut claims = 0_usize;
     let mut outflow: u128 = 0;
-    for change in &history.changes {
-        if change.delta < 0 {
-            claims += 1;
-            outflow += change.delta.unsigned_abs();
+    let mut first_claim: Option<i64> = None;
+    for change in history.changes.iter().filter(|change| change.delta < 0) {
+        claims += 1;
+        outflow += change.delta.unsigned_abs();
+        if let Some(time) = change.block_time {
+            first_claim = Some(first_claim.map_or(time, |first| first.min(time)));
         }
     }
     let outflow_jsol = u64::try_from(outflow).context("JSOL outflow overflows")?;
-    let span_start = if history.covers_window {
+    let span_start = if history.claim_before_window {
         Some(window_start)
     } else {
-        history.oldest_in_window.map(|time| time.max(window_start))
+        first_claim.map(|time| time.max(window_start))
     };
     let span_seconds = span_start.map(|start| (now - start).max(0)).unwrap_or(0);
+    let fallback = |reason: String| BurnEstimate {
+        claims,
+        outflow_jsol,
+        span_seconds,
+        lamports_per_day: fallback_lamports_per_day as f64,
+        source: BurnSource::Fallback(reason),
+    };
+    if claims < 2 {
+        return Ok(fallback(format!(
+            "{claims} claim(s) in the window, at least 2 needed"
+        )));
+    }
     if span_seconds < min_span_seconds {
-        return Ok(BurnEstimate {
-            claims,
-            outflow_jsol,
-            span_seconds,
-            lamports_per_day: fallback_lamports_per_day as f64,
-            source: BurnSource::Fallback(format!(
-                "history spans {:.2} days, less than the required {:.2}",
-                span_seconds as f64 / SECONDS_PER_DAY as f64,
-                min_span_seconds as f64 / SECONDS_PER_DAY as f64
-            )),
-        });
+        return Ok(fallback(format!(
+            "claims span {:.2} days, less than the required {:.2}",
+            span_seconds as f64 / SECONDS_PER_DAY as f64,
+            min_span_seconds as f64 / SECONDS_PER_DAY as f64
+        )));
     }
     let outflow_lamports = jsol_to_lamports(outflow_jsol)?;
     Ok(BurnEstimate {
@@ -186,8 +195,26 @@ pub fn bond_jsol_delta(
     Ok(Some(post as i128 - pre as i128))
 }
 
+fn fetch_transaction(
+    client: &RpcClient,
+    signature: &Signature,
+) -> Result<EncodedConfirmedTransactionWithStatusMeta> {
+    client
+        .get_transaction_with_config(
+            signature,
+            RpcTransactionConfig {
+                encoding: Some(UiTransactionEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                max_supported_transaction_version: Some(0),
+            },
+        )
+        .with_context(|| format!("failed to fetch transaction {signature}"))
+}
+
 /// Walks the token account's signatures back to `window_start`, fetching
-/// each successful transaction in the window for its JSOL delta.
+/// each successful transaction in the window for its JSOL delta, plus the
+/// newest successful one before the window to tell whether claims were
+/// already running at the window start.
 pub fn fetch_bond_history(
     client: &RpcClient,
     token_account: &Pubkey,
@@ -211,10 +238,6 @@ pub fn fetch_bond_history(
             .context("failed to fetch bond JSOL account signatures")?;
         let page_len = page.len();
         for entry in page {
-            if entry.block_time.is_some_and(|time| time < window_start) {
-                history.covers_window = true;
-                return Ok(history);
-            }
             let signature = Signature::from_str(&entry.signature)
                 .with_context(|| format!("RPC returned invalid signature {}", entry.signature))?;
             before = Some(signature);
@@ -227,27 +250,20 @@ pub fn fetch_bond_history(
                     "bond JSOL account {token_account} has more than {MAX_HISTORY_TRANSACTIONS} transactions in the burn window; refusing"
                 );
             }
-            let confirmed = client
-                .get_transaction_with_config(
-                    &signature,
-                    RpcTransactionConfig {
-                        encoding: Some(UiTransactionEncoding::Base64),
-                        commitment: Some(CommitmentConfig::confirmed()),
-                        max_supported_transaction_version: Some(0),
-                    },
-                )
-                .with_context(|| format!("failed to fetch transaction {signature}"))?;
+            let confirmed = fetch_transaction(client, &signature)?;
+            let delta = bond_jsol_delta(&confirmed, token_account, mint)
+                .with_context(|| format!("transaction {signature}"))?;
             let block_time = entry.block_time.or(confirmed.block_time);
-            if let Some(delta) = bond_jsol_delta(&confirmed, token_account, mint)
-                .with_context(|| format!("transaction {signature}"))?
-            {
-                if let Some(time) = block_time {
-                    history.oldest_in_window = Some(
-                        history
-                            .oldest_in_window
-                            .map_or(time, |oldest| oldest.min(time)),
-                    );
+            // Newest first: the first successful transaction before the
+            // window decides whether claims predate it, then we stop.
+            if block_time.is_some_and(|time| time < window_start) {
+                if let Some(delta) = delta {
+                    history.claim_before_window = delta < 0;
+                    return Ok(history);
                 }
+                continue;
+            }
+            if let Some(delta) = delta {
                 history.changes.push(BondJsolChange {
                     signature,
                     block_time,
@@ -306,53 +322,66 @@ mod tests {
         Ok(jsol * 3 / 2)
     }
 
-    #[test]
-    fn short_history_spans_from_first_transaction() {
-        let now = 100 * DAY;
-        let history = BondHistory {
-            changes: vec![
-                change(now - DAY, -100_000_000),
-                change(now - 2 * DAY, -100_000_000),
-                change(now - 3 * DAY, 5_000_000_000),
-                change(now - 10 * DAY, 3_000_000_000),
-            ],
-            covers_window: false,
-            oldest_in_window: Some(now - 10 * DAY),
-        };
-        let estimate = estimate_burn(&history, now - 30 * DAY, now, 3 * DAY, 1, rate_1_5).unwrap();
-        assert_eq!(estimate.source, BurnSource::Observed);
-        assert_eq!(estimate.claims, 2);
-        assert_eq!(estimate.outflow_jsol, 200_000_000);
-        assert_eq!(estimate.span_seconds, 10 * DAY);
-        // 0.2 JSOL * 1.5 over 10 days = 0.03 SOL/day.
-        assert!((estimate.lamports_per_day - 30_000_000.0).abs() < 1e-6);
-        assert!(history.increase_since(now - 4 * DAY).is_some());
-        assert!(history.increase_since(now - 2 * DAY).is_none());
+    fn day_claims(now: i64, days: &[i64], delta: i128) -> Vec<BondJsolChange> {
+        days.iter()
+            .map(|day| change(now - day * DAY - DAY / 4, delta))
+            .collect()
     }
 
     #[test]
-    fn full_history_spans_the_window() {
+    fn recent_claims_after_old_topups_span_from_the_first_claim() {
+        // Today's shape: top-ups 15 days ago, six daily claims of ~0.048
+        // JSOL over the last ~5.3 days, one top-up between.
+        let now = 100 * DAY;
+        let mut changes = day_claims(now, &[0, 1, 2, 3, 4, 5], -48_000_000);
+        changes.push(change(now - 5 * DAY - DAY / 2, 3_763_402_473));
+        changes.push(change(now - 15 * DAY, 3_619_150_934));
+        changes.push(change(now - 15 * DAY - 60, 3_619_150_934));
+        let history = BondHistory {
+            changes,
+            claim_before_window: false,
+        };
+        let rate = |jsol: u64| Ok(jsol * 1_384_341_089 / 1_000_000_000);
+        let estimate = estimate_burn(&history, now - 30 * DAY, now, 3 * DAY, 1, rate).unwrap();
+        assert_eq!(estimate.source, BurnSource::Observed);
+        assert_eq!(estimate.claims, 6);
+        assert_eq!(estimate.outflow_jsol, 288_000_000);
+        assert_eq!(estimate.span_seconds, 5 * DAY + DAY / 4);
+        // 0.288 JSOL * 1.3843 / 5.25 days = 0.0759 SOL/day: about the
+        // 0.067 SOL/day per-claim rate, slightly above (safe side), and
+        // far from the 0.026 a span from the first top-up would give.
+        let sol_per_day = estimate.lamports_per_day / 1e9;
+        assert!((0.065..0.08).contains(&sol_per_day), "{sol_per_day}");
+        assert!(history.increase_since(now - 6 * DAY).is_some());
+        assert!(history.increase_since(now - 5 * DAY).is_none());
+    }
+
+    #[test]
+    fn claims_before_the_window_use_the_full_window() {
         let now = 100 * DAY;
         let history = BondHistory {
-            changes: vec![change(now - DAY, -300_000_000)],
-            covers_window: true,
-            oldest_in_window: Some(now - DAY),
+            changes: day_claims(now, &(0..30).collect::<Vec<_>>(), -10_000_000),
+            claim_before_window: true,
         };
         let estimate = estimate_burn(&history, now - 30 * DAY, now, 3 * DAY, 1, rate_1_5).unwrap();
+        assert_eq!(estimate.source, BurnSource::Observed);
         assert_eq!(estimate.span_seconds, 30 * DAY);
+        // 30 * 0.01 JSOL * 1.5 over 30 days = 0.015 SOL/day.
         assert!((estimate.lamports_per_day - 15_000_000.0).abs() < 1e-6);
     }
 
     #[test]
-    fn too_little_history_uses_fallback() {
+    fn fewer_than_two_claims_or_a_short_span_use_the_fallback() {
         let now = 100 * DAY;
-        let history = BondHistory {
-            changes: vec![change(now - DAY, -300_000_000)],
-            covers_window: false,
-            oldest_in_window: Some(now - 2 * DAY),
+        let one_claim = BondHistory {
+            changes: vec![
+                change(now - 10 * DAY, -300_000_000),
+                change(now - 20 * DAY, 5_000_000_000),
+            ],
+            claim_before_window: false,
         };
         let estimate = estimate_burn(
-            &history,
+            &one_claim,
             now - 30 * DAY,
             now,
             3 * DAY,
@@ -363,6 +392,16 @@ mod tests {
         assert!(matches!(estimate.source, BurnSource::Fallback(_)));
         assert_eq!(estimate.lamports_per_day, 100_000_000.0);
         assert_eq!(estimate.claims, 1);
+
+        let recent = BondHistory {
+            changes: day_claims(now, &[0, 1], -300_000_000),
+            claim_before_window: false,
+        };
+        let estimate = estimate_burn(&recent, now - 30 * DAY, now, 3 * DAY, 7, rate_1_5).unwrap();
+        assert!(matches!(estimate.source, BurnSource::Fallback(_)));
+        assert_eq!(estimate.claims, 2);
+        assert_eq!(estimate.lamports_per_day, 7.0);
+
         let empty = estimate_burn(
             &BondHistory::default(),
             now - 30 * DAY,

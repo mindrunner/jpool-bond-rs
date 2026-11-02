@@ -155,8 +155,7 @@ fn live_history() -> BondHistory {
             change(15 * DAY + DAY / 2, 3_619_150_934),
             change(15 * DAY + DAY / 2 + 60, 3_619_150_934),
         ],
-        covers_window: false,
-        oldest_in_window: Some(NOW - 15 * DAY - DAY / 2 - 60),
+        claim_before_window: false,
     }
 }
 
@@ -370,6 +369,10 @@ fn live_bond_is_healthy_and_reports_burn_and_notes() {
     assert!(matches!(assessment.decision, SquadsDecision::Healthy));
     assert_eq!(assessment.burn.source, BurnSource::Observed);
     assert_eq!(assessment.burn.claims, 6);
+    // The span starts at the first claim, not at the older top-ups.
+    assert_eq!(assessment.burn.span_seconds, 5 * DAY + DAY / 4);
+    let sol_per_day = assessment.burn.lamports_per_day / 1e9;
+    assert!((0.07..0.08).contains(&sol_per_day), "{sol_per_day}");
     assert!(assessment.runway_days > 100.0, "{}", assessment.runway_days);
     assert!(assessment.pending.is_none());
     assert!(
@@ -405,14 +408,15 @@ fn forced_proposal_shows_instructions_and_refuses_non_member() {
     assert!(reason.contains("balance 0 SOL"), "{reason}");
     let plan = assessment.blocked_proposal.as_ref().expect("plan shown");
     assert_eq!(plan.transaction_index, 4);
-    assert_eq!(plan.topup_lamports, LAMPORTS_PER_SOL);
+    // 6 claims over 5.25 days at ~0.077 SOL/day * 30 days = 2.3 -> 2.5 SOL.
+    assert_eq!(plan.topup_lamports, 2_500_000_000);
     assert_eq!(plan.vault_instructions.len(), 4);
     assert_eq!(
         vote_withdraw_lamports(
             &plan.vault_instructions[0].program_id,
             &plan.vault_instructions[0].data
         ),
-        Some(LAMPORTS_PER_SOL)
+        Some(2_500_000_000)
     );
     assert_eq!(
         plan.topup_jsol,
@@ -428,10 +432,10 @@ fn forced_proposal_shows_instructions_and_refuses_non_member() {
     assert!(plan.transaction_size <= MAX_TRANSACTION_SIZE);
     let rendered = render_squads_assessment(&assessment, NOW);
     for needle in [
-        "decision:           propose 1 SOL",
-        "  1. Vote Withdraw 1 SOL",
+        "decision:           propose 2.5 SOL",
+        "  1. Vote Withdraw 2.5 SOL",
         "  2. ATA CreateIdempotent",
-        "  3. JPool DepositSol 1 SOL",
+        "  3. JPool DepositSol 2.5 SOL",
         "  4. bond_top_up",
         "vault simulation:   ok",
         "refused:            proposer",
@@ -447,11 +451,11 @@ fn member_with_balance_gets_an_exact_proposal() {
     let SquadsDecision::Propose(plan) = &assessment.decision else {
         panic!("expected a proposal, got {:?}", assessment.decision);
     };
-    assert_eq!(plan.memo, "jpool-bond-rs top-up 1 SOL");
+    assert_eq!(plan.memo, "jpool-bond-rs top-up 2.5 SOL");
     let args = VaultTransactionCreateArgs::decode(&plan.instructions[0].data).unwrap();
     assert_eq!(args.vault_index, 0);
     assert_eq!(args.ephemeral_signers, 0);
-    assert_eq!(args.memo.as_deref(), Some("jpool-bond-rs top-up 1 SOL"));
+    assert_eq!(args.memo.as_deref(), Some("jpool-bond-rs top-up 2.5 SOL"));
     assert_eq!(
         VaultMessage::decode_transaction_message(&args.transaction_message).unwrap(),
         plan.message
@@ -467,7 +471,7 @@ fn member_with_balance_gets_an_exact_proposal() {
         plan.vault_transaction_rent + plan.proposal_rent + plan.fee_buffer_lamports + 10_000_000
     );
     assert!(is_our_topup(&plan.message, &VALIDATOR_BOND));
-    assert_eq!(message_amount(&plan.message), Some(LAMPORTS_PER_SOL));
+    assert_eq!(message_amount(&plan.message), Some(2_500_000_000));
 
     // Post-submit verification accepts exactly what was planned.
     let addresses = assessment.addresses;

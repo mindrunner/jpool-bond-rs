@@ -122,11 +122,13 @@ account and the vault in one batch, then:
    `burn_lookback_days` is fetched (`getSignaturesForAddress` plus each
    transaction's pre/post token balances). Every transaction that lowered
    the bond's JSOL counts as a claim; increases (top-ups) are ignored. The
-   outflow is divided by the span from the window start to now, or from
-   the first observed transaction when the history is shorter, and
-   converted to SOL at the current pool rate. With less than
-   `burn_min_span_days` of history, `burn_fallback_sol_per_day` is used and
-   the output says so.
+   outflow is divided by the span from the first claim in the window to
+   now, so quiet history before claims started does not dilute the rate
+   (this slightly overestimates it, the safe direction). When the newest
+   transaction before the window was already a claim, the span is the
+   full window. The rate is converted to SOL at the current pool rate.
+   With fewer than two claims, or less than `burn_min_span_days` since the
+   first one, `burn_fallback_sol_per_day` is used and the output says so.
 2. **Runway.** `runway_days = (bond_value_sol - floor_sol) / burn_sol_per_day`
    (0 at or below the floor, infinite with no burn).
 3. **Pending scan.** Proposals of the multisig from `transaction_index`

@@ -134,8 +134,7 @@ impl SquadsDataSource for StaticSource {
                     delta: -50_000_000,
                 })
                 .collect(),
-            covers_window: true,
-            oldest_in_window: Some(now - 10 * 86_400),
+            claim_before_window: true,
         })
     }
 
