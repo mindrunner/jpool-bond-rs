@@ -1,10 +1,14 @@
 pub mod bond;
+pub mod burn;
 pub mod config;
 pub mod history;
 pub mod metrics;
 pub mod pool;
+pub mod squads;
+pub mod squads_mode;
 pub mod token;
 pub mod transaction;
+pub mod vote;
 
 use anyhow::{Context, Result, bail};
 use bond::{
@@ -217,27 +221,47 @@ pub fn fee_buffer_lamports(priority_fee_micro_lamports: u64) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("fee buffer overflow"))
 }
 
-/// Pure guard and decision logic over one chain snapshot.
-pub fn assess(
-    config: &Config,
-    addresses: &Addresses,
-    snapshot: &ChainSnapshot,
-) -> Result<Assessment> {
-    config.validate()?;
-    if *addresses != Addresses::derive(config) {
-        bail!("account addresses do not match the config");
-    }
-    let bond_state_account = snapshot
+/// Addresses of the bond accounts both modes check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BondAddresses {
+    pub bond_state: Pubkey,
+    pub validator_bond: Pubkey,
+    pub bond_token_account: Pubkey,
+}
+
+pub struct BondAccounts<'a> {
+    pub bond_state: Option<&'a ChainAccount>,
+    pub validator_bond: Option<&'a ChainAccount>,
+    pub bond_token_account: Option<&'a ChainAccount>,
+    pub jsol_mint: Option<&'a ChainAccount>,
+    pub stake_pool: Option<&'a ChainAccount>,
+}
+
+pub struct BondCheck {
+    pub bond_state: BondState,
+    pub validator_bond: ValidatorBond,
+    pub bond_jsol: u64,
+    pub pool: pool::JPool,
+}
+
+/// Guards shared by both modes: bond_state, validator_bond, the bond JSOL
+/// ATA, the JSOL mint and the JPool stake pool.
+pub fn check_bond_and_pool(
+    bond_name: &str,
+    vote_account: &Pubkey,
+    addresses: &BondAddresses,
+    accounts: &BondAccounts<'_>,
+) -> Result<BondCheck> {
+    let bond_state_account = accounts
         .bond_state
-        .as_ref()
         .with_context(|| format!("bond_state {} does not exist", addresses.bond_state))?;
     let bond_state = decode_bond_state(&addresses.bond_state, bond_state_account)?;
-    if bond_state.name != config.bond_name {
+    if bond_state.name != bond_name {
         bail!(
             "bond_state {} is named {:?}, expected {:?}",
             addresses.bond_state,
             bond_state.name,
-            config.bond_name
+            bond_name
         );
     }
     if bond_state.bond_type != BondType::Standard {
@@ -256,19 +280,19 @@ pub fn assess(
         );
     }
 
-    let validator_bond_account = snapshot.validator_bond.as_ref().with_context(|| {
+    let validator_bond_account = accounts.validator_bond.with_context(|| {
         format!(
             "validator_bond {} does not exist (vote {} not registered in bond {:?})",
-            addresses.validator_bond, config.vote_account, config.bond_name
+            addresses.validator_bond, vote_account, bond_name
         )
     })?;
     let validator_bond = decode_validator_bond(&addresses.validator_bond, validator_bond_account)?;
-    if validator_bond.vote_account != config.vote_account {
+    if validator_bond.vote_account != *vote_account {
         bail!(
             "validator_bond {} vote account is {}, expected {}",
             addresses.validator_bond,
             validator_bond.vote_account,
-            config.vote_account
+            vote_account
         );
     }
     if validator_bond.state != addresses.bond_state {
@@ -280,7 +304,7 @@ pub fn assess(
         );
     }
 
-    let bond_token_account = snapshot.bond_token_account.as_ref().with_context(|| {
+    let bond_token_account = accounts.bond_token_account.with_context(|| {
         format!(
             "bond JSOL account {} does not exist",
             addresses.bond_token_account
@@ -294,16 +318,53 @@ pub fn assess(
         &jsol_mint(),
     )?;
 
-    let mint_account = snapshot
+    let mint_account = accounts
         .jsol_mint
-        .as_ref()
         .with_context(|| format!("JSOL mint {} does not exist", jsol_mint()))?;
     validate_mint(&jsol_mint(), mint_account, JSOL_DECIMALS)?;
-    let pool_account = snapshot
+    let pool_account = accounts
         .stake_pool
-        .as_ref()
         .with_context(|| format!("stake pool {JPOOL_STAKE_POOL} does not exist"))?;
     let pool = decode_jpool(&JPOOL_STAKE_POOL, pool_account)?;
+    Ok(BondCheck {
+        bond_state,
+        validator_bond,
+        bond_jsol,
+        pool,
+    })
+}
+
+/// Pure guard and decision logic over one chain snapshot.
+pub fn assess(
+    config: &Config,
+    addresses: &Addresses,
+    snapshot: &ChainSnapshot,
+) -> Result<Assessment> {
+    config.validate()?;
+    if *addresses != Addresses::derive(config) {
+        bail!("account addresses do not match the config");
+    }
+    let BondCheck {
+        bond_state,
+        validator_bond,
+        bond_jsol,
+        pool,
+    } = check_bond_and_pool(
+        &config.bond_name,
+        &config.vote_account,
+        &BondAddresses {
+            bond_state: addresses.bond_state,
+            validator_bond: addresses.validator_bond,
+            bond_token_account: addresses.bond_token_account,
+        },
+        &BondAccounts {
+            bond_state: snapshot.bond_state.as_ref(),
+            validator_bond: snapshot.validator_bond.as_ref(),
+            bond_token_account: snapshot.bond_token_account.as_ref(),
+            jsol_mint: snapshot.jsol_mint.as_ref(),
+            stake_pool: snapshot.stake_pool.as_ref(),
+        },
+    )?;
 
     let identity_jsol = snapshot
         .identity_token_account

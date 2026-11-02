@@ -111,6 +111,8 @@ const fn default_identity_reserve() -> SolAmount {
 pub struct MetricsHint {
     pub metrics_file: PathBuf,
     pub vote_account: Option<Pubkey>,
+    /// The file has a `[squads]` table.
+    pub squads_mode: bool,
 }
 
 impl Config {
@@ -125,6 +127,7 @@ impl Config {
         Some(MetricsHint {
             metrics_file,
             vote_account,
+            squads_mode: value.get("squads").is_some(),
         })
     }
 
@@ -132,19 +135,7 @@ impl Config {
         let path = path.as_ref();
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        // toml's error text quotes the offending line, which may be the
-        // rpc_url with its API key; report only the location.
-        let raw: RawConfig = toml::from_str(&raw).map_err(|error| {
-            let location = error
-                .span()
-                .map(|span| format!(" at byte offset {}", span.start))
-                .unwrap_or_default();
-            anyhow::anyhow!(
-                "invalid config {}{location}: {}",
-                path.display(),
-                error.message()
-            )
-        })?;
+        let raw: RawConfig = parse_toml(&raw, path)?;
         let config = Self {
             rpc_url: raw.rpc_url,
             vote_account: Pubkey::from_str(&raw.vote_account).context("invalid vote_account")?,
@@ -208,6 +199,327 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+// toml's error text quotes the offending line, which may be the rpc_url
+// with its API key; report only the location.
+fn parse_toml<T: serde::de::DeserializeOwned>(raw: &str, path: &Path) -> Result<T> {
+    toml::from_str(raw).map_err(|error| {
+        let location = error
+            .span()
+            .map(|span| format!(" at byte offset {}", span.start))
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "invalid config {}{location}: {}",
+            path.display(),
+            error.message()
+        )
+    })
+}
+
+/// Hard cap on one Squads proposal, not raisable via config.
+pub const HARD_MAX_PROPOSAL_SOL: u64 = 20;
+/// Smallest Squads proposal.
+pub const MIN_PROPOSAL_SOL: u64 = 1;
+pub const HARD_MAX_JSOL_MARGIN_BPS: u16 = 500;
+/// Two accounts are read per scanned index, 100 per getMultipleAccounts.
+pub const HARD_MAX_PENDING_SCAN: u64 = 50;
+pub const HARD_MAX_BURN_LOOKBACK_DAYS: u32 = 90;
+/// The proposer must stay rent exempt (0-byte system account) after paying.
+pub const HARD_MIN_PROPOSER_RESERVE_LAMPORTS: u64 = 1_000_000;
+pub const DEFAULT_FLOOR_SOL: u64 = 5;
+pub const DEFAULT_PROPOSE_RUNWAY_DAYS: f64 = 10.0;
+pub const DEFAULT_TOPUP_DAYS: f64 = 30.0;
+pub const DEFAULT_CRITICAL_RUNWAY_DAYS: f64 = 3.0;
+pub const DEFAULT_BURN_LOOKBACK_DAYS: u32 = 30;
+pub const DEFAULT_BURN_MIN_SPAN_DAYS: f64 = 3.0;
+pub const DEFAULT_BURN_FALLBACK_SOL_PER_DAY: f64 = 0.1;
+pub const DEFAULT_PROPOSER_RESERVE_SOL: f64 = 0.01;
+pub const DEFAULT_PENDING_SCAN: u64 = 20;
+pub const DEFAULT_JSOL_MARGIN_BPS: u16 = 100;
+
+/// Squads mode: the bond is funded by a multisig proposal that withdraws
+/// from the vote account; the owner approves it in the Squads UI.
+#[derive(Clone, PartialEq)]
+pub struct SquadsConfig {
+    pub rpc_url: String,
+    pub vote_account: Pubkey,
+    pub bond_name: String,
+    pub priority_fee_micro_lamports: u64,
+    pub metrics_file: PathBuf,
+    pub floor_lamports: u64,
+    pub propose_runway_days: f64,
+    pub topup_days: f64,
+    pub critical_runway_days: f64,
+    pub burn_lookback_days: u32,
+    pub burn_min_span_days: f64,
+    pub burn_fallback_lamports_per_day: u64,
+    pub squads: SquadsSettings,
+}
+
+/// The `[squads]` table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SquadsSettings {
+    pub multisig: Pubkey,
+    pub vault_index: u8,
+    pub proposer_pubkey: Pubkey,
+    pub proposer_keypair_path: PathBuf,
+    pub proposer_reserve_lamports: u64,
+    pub pending_scan: u64,
+    pub jsol_margin_bps: u16,
+}
+
+impl fmt::Debug for SquadsConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SquadsConfig")
+            .field("rpc_url", &"<redacted>")
+            .field("vote_account", &self.vote_account)
+            .field("bond_name", &self.bond_name)
+            .field(
+                "priority_fee_micro_lamports",
+                &self.priority_fee_micro_lamports,
+            )
+            .field("metrics_file", &self.metrics_file)
+            .field("floor_lamports", &self.floor_lamports)
+            .field("propose_runway_days", &self.propose_runway_days)
+            .field("topup_days", &self.topup_days)
+            .field("critical_runway_days", &self.critical_runway_days)
+            .field("burn_lookback_days", &self.burn_lookback_days)
+            .field("burn_min_span_days", &self.burn_min_span_days)
+            .field(
+                "burn_fallback_lamports_per_day",
+                &self.burn_fallback_lamports_per_day,
+            )
+            .field("squads", &self.squads)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSquadsConfig {
+    rpc_url: String,
+    vote_account: String,
+    #[serde(default = "default_bond_name")]
+    bond_name: String,
+    priority_fee_micro_lamports: u64,
+    metrics_file: PathBuf,
+    #[serde(default = "default_floor")]
+    floor_sol: SolAmount,
+    #[serde(default = "default_propose_runway_days")]
+    propose_runway_days: f64,
+    #[serde(default = "default_topup_days")]
+    topup_days: f64,
+    #[serde(default = "default_critical_runway_days")]
+    critical_runway_days: f64,
+    #[serde(default = "default_burn_lookback_days")]
+    burn_lookback_days: u32,
+    #[serde(default = "default_burn_min_span_days")]
+    burn_min_span_days: f64,
+    #[serde(default = "default_burn_fallback")]
+    burn_fallback_sol_per_day: SolAmount,
+    squads: RawSquadsSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSquadsSettings {
+    multisig: String,
+    #[serde(default)]
+    vault_index: u8,
+    proposer_pubkey: String,
+    proposer_keypair_path: PathBuf,
+    #[serde(default = "default_proposer_reserve")]
+    proposer_reserve_sol: SolAmount,
+    #[serde(default = "default_pending_scan")]
+    pending_scan: u64,
+    #[serde(default = "default_jsol_margin_bps")]
+    jsol_margin_bps: u16,
+}
+
+const fn default_floor() -> SolAmount {
+    SolAmount::Integer(DEFAULT_FLOOR_SOL)
+}
+const fn default_propose_runway_days() -> f64 {
+    DEFAULT_PROPOSE_RUNWAY_DAYS
+}
+const fn default_topup_days() -> f64 {
+    DEFAULT_TOPUP_DAYS
+}
+const fn default_critical_runway_days() -> f64 {
+    DEFAULT_CRITICAL_RUNWAY_DAYS
+}
+const fn default_burn_lookback_days() -> u32 {
+    DEFAULT_BURN_LOOKBACK_DAYS
+}
+const fn default_burn_min_span_days() -> f64 {
+    DEFAULT_BURN_MIN_SPAN_DAYS
+}
+const fn default_burn_fallback() -> SolAmount {
+    SolAmount::Decimal(DEFAULT_BURN_FALLBACK_SOL_PER_DAY)
+}
+const fn default_proposer_reserve() -> SolAmount {
+    SolAmount::Decimal(DEFAULT_PROPOSER_RESERVE_SOL)
+}
+const fn default_pending_scan() -> u64 {
+    DEFAULT_PENDING_SCAN
+}
+const fn default_jsol_margin_bps() -> u16 {
+    DEFAULT_JSOL_MARGIN_BPS
+}
+
+fn check_days(field: &str, value: f64, min_exclusive: f64, max: f64) -> Result<()> {
+    if !value.is_finite() || value <= min_exclusive || value > max {
+        bail!("{field} must be in ({min_exclusive}, {max}], got {value}");
+    }
+    Ok(())
+}
+
+impl SquadsConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let raw: RawSquadsConfig = parse_toml(&raw, path)?;
+        let config = Self {
+            rpc_url: raw.rpc_url,
+            vote_account: Pubkey::from_str(&raw.vote_account).context("invalid vote_account")?,
+            bond_name: raw.bond_name,
+            priority_fee_micro_lamports: raw.priority_fee_micro_lamports,
+            metrics_file: raw.metrics_file,
+            floor_lamports: raw.floor_sol.to_lamports("floor_sol")?,
+            propose_runway_days: raw.propose_runway_days,
+            topup_days: raw.topup_days,
+            critical_runway_days: raw.critical_runway_days,
+            burn_lookback_days: raw.burn_lookback_days,
+            burn_min_span_days: raw.burn_min_span_days,
+            burn_fallback_lamports_per_day: raw
+                .burn_fallback_sol_per_day
+                .to_lamports("burn_fallback_sol_per_day")?,
+            squads: SquadsSettings {
+                multisig: Pubkey::from_str(&raw.squads.multisig)
+                    .context("invalid squads.multisig")?,
+                vault_index: raw.squads.vault_index,
+                proposer_pubkey: Pubkey::from_str(&raw.squads.proposer_pubkey)
+                    .context("invalid squads.proposer_pubkey")?,
+                proposer_keypair_path: raw.squads.proposer_keypair_path,
+                proposer_reserve_lamports: raw
+                    .squads
+                    .proposer_reserve_sol
+                    .to_lamports("squads.proposer_reserve_sol")?,
+                pending_scan: raw.squads.pending_scan,
+                jsol_margin_bps: raw.squads.jsol_margin_bps,
+            },
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !(self.rpc_url.starts_with("https://") || self.rpc_url.starts_with("http://")) {
+            bail!("rpc_url must be an http(s) URL");
+        }
+        if self.metrics_file.as_os_str().is_empty() {
+            bail!("metrics_file must not be empty");
+        }
+        if self.squads.proposer_keypair_path.as_os_str().is_empty() {
+            bail!("squads.proposer_keypair_path must not be empty");
+        }
+        if self.bond_name.is_empty() || self.bond_name.len() > 32 {
+            bail!(
+                "bond_name must be 1..=32 bytes, got {} bytes",
+                self.bond_name.len()
+            );
+        }
+        if self.priority_fee_micro_lamports > HARD_MAX_PRIORITY_FEE_MICRO_LAMPORTS {
+            bail!(
+                "priority_fee_micro_lamports must be at most {HARD_MAX_PRIORITY_FEE_MICRO_LAMPORTS}, got {}",
+                self.priority_fee_micro_lamports
+            );
+        }
+        if self.floor_lamports == 0
+            || self.floor_lamports > HARD_MAX_MIN_VALUE_SOL * LAMPORTS_PER_SOL
+        {
+            bail!(
+                "floor_sol must be in (0, {HARD_MAX_MIN_VALUE_SOL}], got {}",
+                format_sol(self.floor_lamports)
+            );
+        }
+        check_days("propose_runway_days", self.propose_runway_days, 0.0, 3650.0)?;
+        check_days("topup_days", self.topup_days, 0.0, 365.0)?;
+        if !self.critical_runway_days.is_finite()
+            || self.critical_runway_days < 0.0
+            || self.critical_runway_days > self.propose_runway_days
+        {
+            bail!(
+                "critical_runway_days must be in [0, propose_runway_days {}], got {}",
+                self.propose_runway_days,
+                self.critical_runway_days
+            );
+        }
+        if self.burn_lookback_days == 0 || self.burn_lookback_days > HARD_MAX_BURN_LOOKBACK_DAYS {
+            bail!(
+                "burn_lookback_days must be in 1..={HARD_MAX_BURN_LOOKBACK_DAYS}, got {}",
+                self.burn_lookback_days
+            );
+        }
+        check_days(
+            "burn_min_span_days",
+            self.burn_min_span_days,
+            0.0,
+            f64::from(self.burn_lookback_days),
+        )?;
+        if self.burn_fallback_lamports_per_day == 0
+            || self.burn_fallback_lamports_per_day > HARD_MAX_PROPOSAL_SOL * LAMPORTS_PER_SOL
+        {
+            bail!(
+                "burn_fallback_sol_per_day must be in (0, {HARD_MAX_PROPOSAL_SOL}], got {}",
+                format_sol(self.burn_fallback_lamports_per_day)
+            );
+        }
+        if self.squads.proposer_reserve_lamports < HARD_MIN_PROPOSER_RESERVE_LAMPORTS {
+            bail!(
+                "squads.proposer_reserve_sol must be at least {}, got {}",
+                format_sol(HARD_MIN_PROPOSER_RESERVE_LAMPORTS),
+                format_sol(self.squads.proposer_reserve_lamports)
+            );
+        }
+        if self.squads.pending_scan == 0 || self.squads.pending_scan > HARD_MAX_PENDING_SCAN {
+            bail!(
+                "squads.pending_scan must be in 1..={HARD_MAX_PENDING_SCAN}, got {}",
+                self.squads.pending_scan
+            );
+        }
+        if self.squads.jsol_margin_bps > HARD_MAX_JSOL_MARGIN_BPS {
+            bail!(
+                "squads.jsol_margin_bps must be at most {HARD_MAX_JSOL_MARGIN_BPS}, got {}",
+                self.squads.jsol_margin_bps
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A config file is Squads mode when it has a `[squads]` table, otherwise
+/// the v0.1 direct mode. Each schema rejects the other's keys.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppConfig {
+    Direct(Config),
+    Squads(SquadsConfig),
+}
+
+impl AppConfig {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read config {}", path.display()))?;
+        let value: toml::Table = parse_toml(&raw, path)?;
+        if value.contains_key("squads") {
+            Ok(Self::Squads(SquadsConfig::load(path)?))
+        } else {
+            Ok(Self::Direct(Config::load(path)?))
+        }
     }
 }
 
@@ -352,6 +664,114 @@ metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
         assert!(!redacted.contains("SECRETKEY123"), "{redacted}");
         assert!(!redacted.contains("0123456789abcdef"), "{redacted}");
         assert_eq!(redact_rpc_url("plain", url), "plain");
+    }
+
+    const SQUADS: &str = r#"
+rpc_url = "https://rpc.example.test"
+vote_account = "steakxfubt37xYdvuXz7BV5Uhhhk1FyJx9zGHfDcTVr"
+priority_fee_micro_lamports = 1000
+metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
+
+[squads]
+multisig = "De838vwWHcbAyNWTTKeKPyviMNHaX91CrD2igGDfZZdM"
+proposer_pubkey = "EUDis6LJeJzDHTEBgfHGQyjHp63XZkGkx4E69xunC2Ej"
+proposer_keypair_path = "/secure/proposer.json"
+"#;
+
+    fn load_app(raw: &str) -> Result<AppConfig> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(raw.as_bytes())?;
+        AppConfig::load(file.path())
+    }
+
+    fn load_squads(raw: &str) -> Result<SquadsConfig> {
+        match load_app(raw)? {
+            AppConfig::Squads(config) => Ok(config),
+            AppConfig::Direct(_) => bail!("loaded as direct mode"),
+        }
+    }
+
+    #[test]
+    fn squads_table_selects_squads_mode_with_defaults() {
+        let config = load_squads(SQUADS).expect("valid squads config");
+        assert_eq!(config.bond_name, "perf");
+        assert_eq!(config.floor_lamports, 5 * LAMPORTS_PER_SOL);
+        assert_eq!(config.propose_runway_days, 10.0);
+        assert_eq!(config.topup_days, 30.0);
+        assert_eq!(config.critical_runway_days, 3.0);
+        assert_eq!(config.burn_lookback_days, 30);
+        assert_eq!(config.burn_min_span_days, 3.0);
+        assert_eq!(config.burn_fallback_lamports_per_day, 100_000_000);
+        assert_eq!(config.squads.vault_index, 0);
+        assert_eq!(config.squads.proposer_reserve_lamports, 10_000_000);
+        assert_eq!(config.squads.pending_scan, 20);
+        assert_eq!(config.squads.jsol_margin_bps, 100);
+        assert!(matches!(load_app(VALID).unwrap(), AppConfig::Direct(_)));
+    }
+
+    #[test]
+    fn modes_reject_each_others_keys() {
+        for key in [
+            "identity_pubkey = \"EUDis6LJeJzDHTEBgfHGQyjHp63XZkGkx4E69xunC2Ej\"",
+            "min_value_sol = 8",
+            "topup_sol = 5",
+            "identity_reserve_sol = 10",
+        ] {
+            let raw = SQUADS.replace("[squads]", &format!("{key}\n[squads]"));
+            assert!(load_app(&raw).is_err(), "squads mode accepted {key}");
+        }
+        assert!(load_app(&format!("{VALID}floor_sol = 5\n")).is_err());
+        assert!(load_app(&format!("{SQUADS}unknown = 1\n")).is_err());
+    }
+
+    #[test]
+    fn squads_bounds_are_enforced() {
+        for (key, value) in [
+            ("jsol_margin_bps", "501"),
+            ("pending_scan", "0"),
+            ("pending_scan", "51"),
+            ("proposer_reserve_sol", "0.0001"),
+        ] {
+            let raw = format!("{SQUADS}{key} = {value}\n");
+            assert!(load_app(&raw).is_err(), "accepted {key} = {value}");
+        }
+        assert!(load_squads(&format!("{SQUADS}jsol_margin_bps = 500\n")).is_ok());
+        for line in [
+            "floor_sol = 0",
+            "floor_sol = 51",
+            "propose_runway_days = 0",
+            "critical_runway_days = 11",
+            "topup_days = 0",
+            "burn_lookback_days = 91",
+            "burn_min_span_days = 31",
+            "burn_fallback_sol_per_day = 0",
+            "priority_fee_micro_lamports = 1000001",
+        ] {
+            let key = line.split(' ').next().unwrap();
+            let raw = if SQUADS.contains(&format!("{key} =")) {
+                SQUADS.replace("priority_fee_micro_lamports = 1000", line)
+            } else {
+                SQUADS.replace("[squads]", &format!("{line}\n[squads]"))
+            };
+            assert!(load_app(&raw).is_err(), "accepted {line}");
+        }
+        let forced = SQUADS.replace("[squads]", "propose_runway_days = 1000\n[squads]");
+        assert_eq!(load_squads(&forced).unwrap().propose_runway_days, 1000.0);
+    }
+
+    #[test]
+    fn squads_parse_errors_and_debug_do_not_echo_the_rpc_url() {
+        let secret = "https://rpc.example.test/?api-key=SECRETKEY";
+        let broken = SQUADS
+            .replace("https://rpc.example.test", secret)
+            .replace("[squads]", "floor_sol = \"five\"\n[squads]");
+        let error = format!("{:#}", load_app(&broken).expect_err("broken config"));
+        assert!(!error.contains("SECRETKEY"), "{error}");
+        let debug = format!(
+            "{:?}",
+            load_app(&SQUADS.replace("https://rpc.example.test", secret))
+        );
+        assert!(!debug.contains("SECRETKEY"), "{debug}");
     }
 
     #[test]

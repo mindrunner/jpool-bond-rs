@@ -1,0 +1,97 @@
+{
+ "transaction": [
+  "AQL7HzhUdbQeEofECO3rB784gW9YboPuGoZ0eoJdNun9HLV24DbvAmi0dLLT/4HSZwtI7R5e7iRu0u1YiVDQ8A+AAQADB1e0Utc6MJzJ05lqrf+neHzV9XNesKIOKddYLwk5TKrwu86wi8BgQqgIqNTEbcgIpB2ehwQANvdN9UDHdT01p9wHDjnR2g5/IIhmg//Z9hfsP+WK2+spF4RSLQOjhYsoF5+jIHCtEx1jrOXrGqIhuDZF71WZ3RmiiAQweSaPOqyGAwZGb+UhFzL/7K26csOb57yM5bvF9xJrLEObOkAAAAAGgcTOR+IjaLixVV7Ih68JLvx++7Zso/Uvv2jUrJy3qAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAyC68sAc4JvxlETbyhsX214CPoNMuk8ksqksgiP0s83QFBAAJAz3HAAAAAAAABAAFAvBJAgAFBQECAAAGygEw+k6o0OLa0wAAuwAAAAEBAQVyrU/nXbmEqarqPkC6+yuLcJqkdpHtZnabJM7+gqX/A62pCmpKj8nJFLdlYCpMT9hQdUOoJsVl+Mn6Ap/8nummBqHYF5E3VCqYNDe9/ip6slV/U1yKeHIraKSdwAAAAAAGp9UXGMd0yShWY5hpHV62i164o5tLbVxzVVshAAAAAAan1RcZNYTQ/u2bs0MdEyBr5UQoG1e4VmzFN1/0AAAAAQIFAQADBAAMAAQAAAD6Gl8AAAAAAAAABQUBAwAABhHcPEngHmxPnwIAAAAAAAAAAAUDAQADCZAlpIi82Cr4AAA=",
+  "base64"
+ ],
+ "meta": {
+  "err": null,
+  "status": {
+   "Ok": null
+  },
+  "fee": 12651,
+  "preBalances": [
+   30678796641,
+   1991360,
+   0,
+   0,
+   1,
+   12171440,
+   1
+  ],
+  "postBalances": [
+   30673714150,
+   1991360,
+   2113280,
+   2956560,
+   1,
+   12171440,
+   1
+  ],
+  "innerInstructions": [
+   {
+    "index": 2,
+    "instructions": [
+     {
+      "programIdIndex": 6,
+      "accounts": [
+       0,
+       2
+      ],
+      "data": "11111XRqT87WyTGUQNZLYHFMYmsm5rQnr3sf1zcpPsvCTcAtqRUSZ5bMXXQrPriCZe8QF",
+      "stackHeight": 2
+     }
+    ]
+   },
+   {
+    "index": 3,
+    "instructions": [
+     {
+      "programIdIndex": 6,
+      "accounts": [
+       0,
+       3
+      ],
+      "data": "1111bHTnkuN534DFtyXegKmPVSS2cGJRjaizguj2Xz7zDJKr24qRUhqHRhxmJWDgoyfX5",
+      "stackHeight": 2
+     }
+    ]
+   }
+  ],
+  "logMessages": [
+   "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+   "Program ComputeBudget111111111111111111111111111111 success",
+   "Program ComputeBudget111111111111111111111111111111 invoke [1]",
+   "Program ComputeBudget111111111111111111111111111111 success",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf invoke [1]",
+   "Program log: Instruction: VaultTransactionCreate",
+   "Program 11111111111111111111111111111111 invoke [2]",
+   "Program 11111111111111111111111111111111 success",
+   "Program log: transaction index: 2",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf consumed 27589 of 149700 compute units",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf success",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf invoke [1]",
+   "Program log: Instruction: ProposalCreate",
+   "Program 11111111111111111111111111111111 invoke [2]",
+   "Program 11111111111111111111111111111111 success",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf consumed 13525 of 122111 compute units",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf success",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf invoke [1]",
+   "Program log: Instruction: ProposalApprove",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf consumed 8968 of 108586 compute units",
+   "Program SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf success"
+  ],
+  "preTokenBalances": [],
+  "postTokenBalances": [],
+  "rewards": [],
+  "loadedAddresses": {
+   "writable": [],
+   "readonly": []
+  },
+  "computeUnitsConsumed": 50382,
+  "costUnits": 52722
+ },
+ "version": 0,
+ "slot": 463399657,
+ "transactionIndex": 320,
+ "blockTime": 1793387803
+}

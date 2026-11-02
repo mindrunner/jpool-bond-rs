@@ -2,9 +2,10 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use jpool_bond_rs::{
     Addresses, Assessment, ChainDataSource, Decision, MAX_ATTEMPTS, RpcChainDataSource,
-    config::{Config, format_base_units, format_sol, redact_rpc_url},
-    metrics::{FileMetricsSink, MetricsSink, RunMetrics},
+    config::{AppConfig, Config, format_base_units, format_sol, redact_rpc_url},
+    metrics::{FileMetricsSink, MetricsSink, RunMetrics, SquadsRunMetrics},
     plan, render_assessment,
+    squads_mode::RpcSquadsDataSource,
     transaction::submit_with_backend,
     verify_topup,
 };
@@ -19,6 +20,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod squads_cli;
+
 #[derive(Debug, Parser)]
 #[command(about = "Guarded JPool performance bond (JSOL) top-up")]
 struct Cli {
@@ -28,12 +31,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Read-only: evaluate guards and print the decision. Never loads the keypair.
+    /// Read-only: evaluate guards and print the decision. Never loads a keypair.
     Plan {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Evaluate, and if the bond is below the floor, sign and submit one top-up.
+    /// Evaluate, and if action is due, submit one top-up (direct mode) or one
+    /// Squads proposal (Squads mode).
     Run {
         #[arg(long)]
         config: PathBuf,
@@ -95,7 +99,31 @@ fn run_cli<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
         Command::Plan { config } => (config.as_path(), Mode::Plan),
         Command::Run { config } => (config.as_path(), Mode::Run),
     };
-    let config = load_config(config_path, sink)?;
+    let config = match load_config(config_path, sink)? {
+        AppConfig::Direct(config) => config,
+        AppConfig::Squads(config) => {
+            let client = RpcClient::new_with_commitment(
+                config.rpc_url.clone(),
+                solana_commitment_config::CommitmentConfig::confirmed(),
+            );
+            let source = RpcSquadsDataSource { client: &client };
+            let executor = squads_cli::RpcSquadsExecutor {
+                client: &client,
+                priority_fee_micro_lamports: config.priority_fee_micro_lamports,
+            };
+            return squads_cli::execute_squads(
+                mode,
+                &config,
+                sink,
+                &source,
+                &executor,
+                now_seconds(),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(redact_rpc_url(&format!("{error:#}"), &config.rpc_url))
+            });
+        }
+    };
     // The default finalized commitment rejects confirmed blockhashes.
     let client = RpcClient::new_with_commitment(
         config.rpc_url.clone(),
@@ -111,11 +139,24 @@ fn run_cli<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
         .map_err(|error| anyhow::anyhow!(redact_rpc_url(&format!("{error:#}"), &config.rpc_url)))
 }
 
-fn load_config<S: MetricsSink>(path: &Path, sink: &S) -> Result<Config> {
-    match Config::load(path) {
+fn load_config<S: MetricsSink>(path: &Path, sink: &S) -> Result<AppConfig> {
+    match AppConfig::load(path) {
         Ok(config) => Ok(config),
         Err(error) => {
             if let Some(hint) = Config::metrics_hint(path) {
+                if hint.squads_mode {
+                    let metrics = SquadsRunMetrics {
+                        vote: hint.vote_account,
+                        last_run_timestamp_seconds: now_seconds(),
+                        ..SquadsRunMetrics::default()
+                    };
+                    return Err(squads_cli::with_failure_metrics(
+                        sink,
+                        &hint.metrics_file,
+                        &metrics,
+                        error,
+                    ));
+                }
                 let metrics = RunMetrics {
                     vote: hint.vote_account,
                     last_run_timestamp_seconds: now_seconds(),

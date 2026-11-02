@@ -97,14 +97,23 @@ pub struct ValidatorBond {
     pub pending_unlock_epoch: u64,
 }
 
-struct Reader<'a> {
-    data: &'a [u8],
-    offset: usize,
-    what: &'static str,
+/// Minimal little-endian borsh reader with bounds-checked access.
+pub(crate) struct Reader<'a> {
+    pub(crate) data: &'a [u8],
+    pub(crate) offset: usize,
+    pub(crate) what: &'static str,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+    pub(crate) fn new(data: &'a [u8], offset: usize, what: &'static str) -> Self {
+        Self { data, offset, what }
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.offset)
+    }
+
+    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8]> {
         let end = self
             .offset
             .checked_add(len)
@@ -122,27 +131,27 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
     }
 
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
     }
 
-    fn u64(&mut self) -> Result<u64> {
+    pub(crate) fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
 
-    fn i64(&mut self) -> Result<i64> {
+    pub(crate) fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into()?))
     }
 
-    fn pubkey(&mut self) -> Result<Pubkey> {
+    pub(crate) fn pubkey(&mut self) -> Result<Pubkey> {
         Ok(Pubkey::new_from_array(self.take(32)?.try_into()?))
     }
 }
