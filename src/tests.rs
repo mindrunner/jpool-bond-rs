@@ -447,3 +447,107 @@ fn fee_buffer_covers_all_attempts() {
     // (1_000 * 1_400_000 / 1e6 + 5_000) * 3
     assert_eq!(fee_buffer_lamports(1_000).unwrap(), 19_200);
 }
+
+#[test]
+fn withdraw_plan_moves_jsol_to_the_identity_then_pays_sol_out() {
+    use crate::{
+        bond::{BOND_WITHDRAW_DISCRIMINATOR, SYSTEM_PROGRAM_ID},
+        pool::STAKE_POOL_PROGRAM_ID,
+        withdraw::plan_withdraw,
+    };
+    let config = config(8, IDENTITY);
+    let addresses = Addresses::derive(&config);
+    let destination = Pubkey::new_unique();
+    let plan = plan_withdraw(
+        &addresses,
+        &live_snapshot(0),
+        IDENTITY,
+        7_500_000_000,
+        destination,
+    )
+    .expect("withdraw plan");
+    assert_eq!(plan.bond_jsol_before, LIVE_BOND_JSOL);
+    assert!(plan.withdraw_jsol > 0 && plan.withdraw_jsol < LIVE_BOND_JSOL);
+    // Rounded down: never more than the requested value.
+    assert!(plan.withdraw_value_lamports <= 7_500_000_000);
+    assert!(plan.withdraw_value_lamports > 7_499_000_000);
+    assert_eq!(plan.instructions.len(), 3);
+
+    let identity_jsol = associated_token_address(&IDENTITY, &jsol_mint());
+    let withdraw = &plan.instructions[1];
+    assert_eq!(withdraw.program_id, BOND_PROGRAM_ID);
+    assert_eq!(withdraw.data[..8], BOND_WITHDRAW_DISCRIMINATOR);
+    assert_eq!(
+        u64::from_le_bytes(withdraw.data[8..16].try_into().unwrap()),
+        plan.withdraw_jsol
+    );
+    // Order of the on-chain Anchor IDL: bond_state, validator_bond,
+    // withdrawal_authority, destination, destination_token_account,
+    // bond_token_account, stake_account (None), system, token, stake (None).
+    assert_eq!(
+        withdraw
+            .accounts
+            .iter()
+            .map(|meta| meta.pubkey)
+            .collect::<Vec<_>>(),
+        vec![
+            addresses.bond_state,
+            addresses.validator_bond,
+            IDENTITY,
+            IDENTITY,
+            identity_jsol,
+            addresses.bond_token_account,
+            BOND_PROGRAM_ID,
+            SYSTEM_PROGRAM_ID,
+            token_program_id(),
+            BOND_PROGRAM_ID,
+        ]
+    );
+    assert!(withdraw.accounts[2].is_signer && !withdraw.accounts[3].is_signer);
+
+    let withdraw_sol = &plan.instructions[2];
+    assert_eq!(withdraw_sol.program_id, STAKE_POOL_PROGRAM_ID);
+    assert_eq!(
+        withdraw_sol.data[0], 16,
+        "StakePoolInstruction::WithdrawSol"
+    );
+    assert_eq!(
+        u64::from_le_bytes(withdraw_sol.data[1..9].try_into().unwrap()),
+        plan.withdraw_jsol
+    );
+    assert_eq!(withdraw_sol.accounts[2].pubkey, IDENTITY);
+    assert!(withdraw_sol.accounts[2].is_signer);
+    assert_eq!(withdraw_sol.accounts[3].pubkey, identity_jsol);
+    assert_eq!(withdraw_sol.accounts[5].pubkey, destination);
+}
+
+#[test]
+fn withdraw_plan_refuses_another_identity_and_too_much() {
+    use crate::withdraw::plan_withdraw;
+    let config = config(8, IDENTITY);
+    let addresses = Addresses::derive(&config);
+    let snapshot = live_snapshot(0);
+    let other = Pubkey::new_unique();
+    let error = plan_withdraw(&addresses, &snapshot, other, 1_000_000_000, other).unwrap_err();
+    assert!(
+        error.to_string().contains("validator bond identity"),
+        "{error}"
+    );
+    let error =
+        plan_withdraw(&addresses, &snapshot, IDENTITY, 1_000_000_000_000, other).unwrap_err();
+    assert!(error.to_string().contains("cannot withdraw"), "{error}");
+    let error = plan_withdraw(&addresses, &snapshot, IDENTITY, 1, other).unwrap_err();
+    assert!(error.to_string().contains("below one JSOL"), "{error}");
+}
+
+#[test]
+fn parses_sol_amounts_exactly() {
+    use crate::withdraw::parse_sol;
+    assert_eq!(parse_sol("7.5").unwrap(), 7_500_000_000);
+    assert_eq!(parse_sol("7").unwrap(), 7_000_000_000);
+    assert_eq!(parse_sol("0.000000001").unwrap(), 1);
+    assert_eq!(parse_sol(".25").unwrap(), 250_000_000);
+    for bad in ["", ".", "0", "-1", "1.0000000001", "1,5", "abc", "1e3"] {
+        assert!(parse_sol(bad).is_err(), "{bad} must be rejected");
+    }
+}

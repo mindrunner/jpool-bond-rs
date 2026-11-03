@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod pool;
 pub mod token;
 pub mod transaction;
+pub mod withdraw;
 
 use anyhow::{Context, Result, bail};
 use bond::{
