@@ -1760,11 +1760,12 @@ dependencies = [
 
 [[package]]
 name = "jpool-bond-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "borsh",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
  "solana-client",

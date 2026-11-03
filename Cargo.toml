@@ -1,6 +1,6 @@
 [package]
 name = "jpool-bond-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Guarded JPool performance bond (JSOL) top-up automation for Solana validators"
@@ -10,7 +10,10 @@ repository = "https://github.com/mindrunner/jpool-bond-rs"
 anyhow = "1.0.102"
 borsh = { version = "1.6.1", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
+# Same reqwest as solana-client already pulls in; blocking for JPool's bond API.
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 solana-client = "=4.1.0-beta.1"
 solana-commitment-config = "=3.1.1"
 solana-compute-budget-interface = "=3.0.0"
@@ -27,5 +30,4 @@ spl-stake-pool = { git = "https://github.com/solana-program/stake-pool", rev = "
 toml = "1.1.2"
 
 [dev-dependencies]
-serde_json = "1.0"
 tempfile = "3.27.0"

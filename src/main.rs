@@ -140,7 +140,10 @@ fn run_cli<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
         config.rpc_url.clone(),
         solana_commitment_config::CommitmentConfig::confirmed(),
     );
-    let source = RpcChainDataSource { client: &client };
+    let source = RpcChainDataSource {
+        client: &client,
+        bond_api_url: &config.bond_api_url,
+    };
     let executor = RpcExecutor {
         client: &client,
         priority_fee_micro_lamports: config.priority_fee_micro_lamports,
@@ -169,7 +172,11 @@ fn run_withdraw(
     );
     let result = (|| -> Result<()> {
         let addresses = Addresses::derive(&config);
-        let snapshot = RpcChainDataSource { client: &client }.snapshot(&addresses)?;
+        let snapshot = RpcChainDataSource {
+            client: &client,
+            bond_api_url: &config.bond_api_url,
+        }
+        .snapshot(&addresses)?;
         // Dry runs take the identity from the bond itself, so they never need
         // the key; real runs check the key against it in plan_withdraw.
         let keypair = if dry_run {
@@ -201,9 +208,8 @@ fn run_withdraw(
             format_sol(plan.withdraw_value_lamports)
         );
         println!(
-            "bond after:         ~{} SOL (floor {} SOL)",
-            format_sol(plan.bond_value_after_lamports),
-            format_sol(config.min_value_lamports)
+            "bond after:         ~{} SOL",
+            format_sol(plan.bond_value_after_lamports)
         );
         match keypair {
             None => {
@@ -276,7 +282,6 @@ fn base_metrics(config: &Config, now: u64) -> RunMetrics {
     RunMetrics {
         vote: Some(config.vote_account),
         last_run_timestamp_seconds: now,
-        min_value_lamports: Some(config.min_value_lamports),
         ..RunMetrics::default()
     }
 }
@@ -286,6 +291,9 @@ fn assessment_metrics(config: &Config, assessment: &Assessment, now: u64) -> Run
         bond_value_lamports: Some(assessment.bond_value_lamports),
         bond_jsol: Some(assessment.bond_jsol),
         jsol_sol_rate: Some(assessment.jsol_sol_rate),
+        min_value_lamports: Some(assessment.min_value_lamports),
+        required_lamports: Some(assessment.sizing.required_lamports),
+        target_lamports: Some(assessment.sizing.target_lamports),
         identity_lamports: Some(assessment.identity_lamports),
         ..base_metrics(config, now)
     }

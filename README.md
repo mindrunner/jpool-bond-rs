@@ -1,6 +1,7 @@
 # jpool-bond-rs
 
-Keeps a validator's JPool performance bond (JSOL collateral) above a floor.
+Keeps a validator's JPool performance bond (JSOL collateral) sized to JPool's
+own bond requirement.
 Built to run as a daily one-shot from a systemd timer, but works standalone.
 
 ## How it works
@@ -9,11 +10,19 @@ Each run derives every account from the config, reads them in one batch, and
 values the bond: the JSOL in the bond's token account times the JPool rate
 (`total_lamports / pool_token_supply` from the stake pool account).
 
-If the value is at or above `min_value_sol`, nothing happens. If it is below,
-the run tops up `topup_sol` SOL in one atomic transaction:
+The requirement comes from JPool's bond API
+(`{bond_api_url}/{vote}/bond`, `current.security_required +
+current.perf_required`; the response must name our vote account), and never
+counts as less than `min_required_sol`. JPool's docs (Validator Docs, "Bonds")
+define the security part as 0.5 SOL per 1,000 SOL of the validator's JPool
+stake and the performance part from the APY gap.
+
+If the value is at or above `trigger_ratio` x required, nothing happens. If it
+is below, the run tops up to `target_ratio` x required, at most
+`max_topup_sol`, in one atomic transaction (a failed API read fails the run):
 
 1. create the identity's JSOL ATA (idempotent; it is the staging account),
-2. JPool `DepositSol` of `topup_sol` from the identity into that ATA,
+2. JPool `DepositSol` of the top-up from the identity into that ATA,
 3. bond program `bond_top_up` with exactly the JSOL that deposit mints.
 
 The minted amount is computed with the stake pool program's own math (SOL
@@ -59,8 +68,9 @@ the actual values, and `jpool_bond_last_run_success` is 0.
   `bond_top_up`. No local state, so a crash mid-run cannot cause a second
   top-up.
 
-Hard limits (not raisable via config): `topup_sol` at most 10,
-`min_value_sol` at most 50, `identity_reserve_sol` at least 1,
+Hard limits (not raisable via config): `max_topup_sol` at most 10,
+`min_required_sol` at most 50, ratios within 1 <= trigger <= target <= 5,
+`identity_reserve_sol` at least 1,
 `priority_fee_micro_lamports` at most 1000000, three attempts.
 
 ## RPC
@@ -82,8 +92,11 @@ vote_account = "steakxfubt37xYdvuXz7BV5Uhhhk1FyJx9zGHfDcTVr"
 identity_pubkey = "EUDis6LJeJzDHTEBgfHGQyjHp63XZkGkx4E69xunC2Ej"
 identity_keypair_path = "/etc/jpool-bond/identity.json"
 bond_name = "perf"                    # optional, default "perf"
-min_value_sol = 8
-topup_sol = 5
+bond_api_url = "https://api.jpool.one/allocation/validators"  # optional, default
+min_required_sol = 5                  # optional, default 5
+trigger_ratio = 1.5                   # optional, default 1.5
+target_ratio = 2                      # optional, default 2
+max_topup_sol = 10                    # optional, default 10
 identity_reserve_sol = 10             # optional, default 10
 priority_fee_micro_lamports = 1000
 metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
@@ -109,7 +122,9 @@ Every run atomically replaces a Prometheus textfile. All series carry a
 | `jpool_bond_value_sol` | SOL value of the bond's JSOL |
 | `jpool_bond_jsol` | JSOL in the bond |
 | `jpool_bond_jsol_sol_rate` | SOL per JSOL |
-| `jpool_bond_min_value_sol` | configured floor |
+| `jpool_bond_min_value_sol` | value below which a top-up runs (trigger x required) |
+| `jpool_bond_required_sol` | requirement used (JPool's, at least `min_required_sol`) |
+| `jpool_bond_target_sol` | value a top-up aims for (target x required) |
 | `jpool_bond_identity_balance_sol` | identity SOL balance |
 | `jpool_bond_last_topup_sol` | SOL topped up by this run, 0 if none |
 | `jpool_bond_last_run_success` | 1 on success, 0 on any error or refusal |

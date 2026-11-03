@@ -186,8 +186,13 @@ fn config(min_value_sol: u64, identity: Pubkey) -> Config {
         identity_pubkey: identity,
         identity_keypair_path: PathBuf::from("/nonexistent/identity.json"),
         bond_name: "perf".into(),
-        min_value_lamports: min_value_sol * config::LAMPORTS_PER_SOL,
-        topup_lamports: 5 * config::LAMPORTS_PER_SOL,
+        bond_api_url: config::DEFAULT_BOND_API_URL.into(),
+        // Legacy-equivalent sizing for these fixtures: the floor is the
+        // minimum requirement (trigger 1x) and every top-up is the 5 SOL cap.
+        min_required_lamports: min_value_sol * config::LAMPORTS_PER_SOL,
+        trigger_ratio_bps: config::RATIO_ONE_BPS,
+        target_ratio_bps: config::HARD_MAX_RATIO_BPS,
+        max_topup_lamports: 5 * config::LAMPORTS_PER_SOL,
         identity_reserve_lamports: 10 * config::LAMPORTS_PER_SOL,
         priority_fee_micro_lamports: 1_000,
         metrics_file: PathBuf::from("/nonexistent/unused.prom"),
@@ -246,7 +251,8 @@ fn live_snapshot(identity_lamports: u64) -> ChainSnapshot {
 
 fn assess_live(min_value_sol: u64, snapshot: &ChainSnapshot) -> Result<Assessment> {
     let config = config(min_value_sol, IDENTITY);
-    assess(&config, &Addresses::derive(&config), snapshot)
+    let sizing = sizing(&config, 0)?;
+    assess(&config, &Addresses::derive(&config), snapshot, &sizing)
 }
 
 #[test]
@@ -388,6 +394,10 @@ impl ChainDataSource for StaticSource {
     ) -> Result<Option<RecentTopUp>> {
         self.cooldown_queries.borrow_mut().push(since_unix);
         Ok(self.recent.clone())
+    }
+
+    fn bond_requirement(&self, _addresses: &Addresses) -> Result<u64> {
+        Ok(0)
     }
 }
 
@@ -550,4 +560,86 @@ fn parses_sol_amounts_exactly() {
     for bad in ["", ".", "0", "-1", "1.0000000001", "1,5", "abc", "1e3"] {
         assert!(parse_sol(bad).is_err(), "{bad} must be rejected");
     }
+}
+
+fn default_sizing_config() -> Config {
+    Config {
+        min_required_lamports: config::DEFAULT_MIN_REQUIRED_SOL * config::LAMPORTS_PER_SOL,
+        trigger_ratio_bps: 15_000,
+        target_ratio_bps: 20_000,
+        max_topup_lamports: config::DEFAULT_MAX_TOPUP_SOL * config::LAMPORTS_PER_SOL,
+        ..config(8, IDENTITY)
+    }
+}
+
+#[test]
+fn sizing_uses_jpool_requirement_with_minimum_and_ratios() {
+    let config = default_sizing_config();
+    // Mainnet 2026-11-03: security 5.635761277 + performance 0.08413707 SOL.
+    let s = sizing(&config, 5_719_898_347).unwrap();
+    assert_eq!(s.required_lamports, 5_719_898_347);
+    assert_eq!(s.threshold_lamports, 8_579_847_520);
+    assert_eq!(s.target_lamports, 11_439_796_694);
+    // Below the minimum the minimum counts.
+    let s = sizing(&config, 1_000_000_000).unwrap();
+    assert_eq!(s.api_required_lamports, 1_000_000_000);
+    assert_eq!(s.required_lamports, 5_000_000_000);
+    assert_eq!(s.threshold_lamports, 7_500_000_000);
+    assert_eq!(s.target_lamports, 10_000_000_000);
+}
+
+#[test]
+fn tops_up_to_the_target_and_caps_the_amount() {
+    let config = default_sizing_config();
+    let addresses = Addresses::derive(&config);
+    let snapshot = live_snapshot(78 * config::LAMPORTS_PER_SOL);
+    let value = assess(&config, &addresses, &snapshot, &sizing(&config, 0).unwrap())
+        .unwrap()
+        .bond_value_lamports;
+    // Above the threshold: nothing to do, nothing planned.
+    let above = assess(&config, &addresses, &snapshot, &sizing(&config, 0).unwrap()).unwrap();
+    assert!(value >= above.min_value_lamports);
+    assert!(matches!(above.decision, Decision::NoTopUp));
+    assert_eq!(above.topup_lamports, 0);
+
+    // Requirement just over value / 1.5: top up exactly target - value.
+    let requirement = value / 3 * 2 + 1_000_000_000;
+    let s = sizing(&config, requirement).unwrap();
+    let below = assess(&config, &addresses, &snapshot, &s).unwrap();
+    assert!(value < s.threshold_lamports);
+    assert_eq!(below.topup_lamports, s.target_lamports - value);
+    match below.decision {
+        Decision::TopUp(plan) => assert_eq!(plan.quote.lamports, s.target_lamports - value),
+        other => panic!("expected a top-up, got {other:?}"),
+    }
+
+    // A huge requirement (a wrong API read) costs at most the cap.
+    let s = sizing(&config, 1_000 * config::LAMPORTS_PER_SOL).unwrap();
+    let capped = assess(&config, &addresses, &snapshot, &s).unwrap();
+    assert_eq!(capped.topup_lamports, 10 * config::LAMPORTS_PER_SOL);
+}
+
+#[test]
+fn parses_the_jpool_bond_api_requirement() {
+    let body = serde_json::json!({
+        "vote_account": VOTE.to_string(),
+        "epoch": 1076,
+        "current": {
+            "security_required": 5_635_761_277_u64,
+            "perf_required": 84_137_070_u64,
+            "balance": 14_753_830_908_u64
+        }
+    });
+    assert_eq!(parse_bond_requirement(&body, &VOTE).unwrap(), 5_719_898_347);
+    let other = Pubkey::new_unique();
+    assert!(parse_bond_requirement(&body, &other).is_err());
+    let mut missing = body.clone();
+    missing["current"]
+        .as_object_mut()
+        .unwrap()
+        .remove("perf_required");
+    assert!(parse_bond_requirement(&missing, &VOTE).is_err());
+    let mut negative = body;
+    negative["current"]["security_required"] = serde_json::json!(-1);
+    assert!(parse_bond_requirement(&negative, &VOTE).is_err());
 }
