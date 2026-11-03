@@ -19,6 +19,8 @@ pub struct RunMetrics {
     pub bond_jsol: Option<u64>,
     pub jsol_sol_rate: Option<f64>,
     pub min_value_lamports: Option<u64>,
+    pub required_lamports: Option<u64>,
+    pub target_lamports: Option<u64>,
     pub identity_lamports: Option<u64>,
     /// SOL deposited into the bond by this run; 0 when none.
     pub last_topup_lamports: u64,
@@ -88,7 +90,25 @@ pub fn render_prometheus(metrics: &RunMetrics) -> Result<String> {
         gauge(
             &mut output,
             "jpool_bond_min_value_sol",
-            "Configured bond value floor in SOL",
+            "Bond value below which a top-up runs (trigger ratio x required) in SOL",
+            &labels,
+            &format_base_units(value),
+        )?;
+    }
+    if let Some(value) = metrics.required_lamports {
+        gauge(
+            &mut output,
+            "jpool_bond_required_sol",
+            "Bond requirement (JPool security + performance, at least the configured minimum) in SOL",
+            &labels,
+            &format_base_units(value),
+        )?;
+    }
+    if let Some(value) = metrics.target_lamports {
+        gauge(
+            &mut output,
+            "jpool_bond_target_sol",
+            "Bond value a top-up aims for (target ratio x required) in SOL",
             &labels,
             &format_base_units(value),
         )?;
@@ -207,6 +227,8 @@ mod tests {
             bond_jsol: Some(11_001_704_341),
             jsol_sol_rate: Some(1.382),
             min_value_lamports: Some(8_000_000_000),
+            required_lamports: Some(5_720_000_000),
+            target_lamports: Some(11_440_000_000),
             identity_lamports: Some(78_700_681_661),
             last_topup_lamports: 0,
         }

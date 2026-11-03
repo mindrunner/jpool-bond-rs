@@ -10,8 +10,16 @@ use std::{
 pub const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 /// Hard cap on one top-up, not raisable via config.
 pub const HARD_MAX_TOPUP_SOL: u64 = 10;
-/// Hard cap on the floor, not raisable via config.
-pub const HARD_MAX_MIN_VALUE_SOL: u64 = 50;
+/// Hard cap on the minimum requirement, not raisable via config.
+pub const HARD_MAX_MIN_REQUIRED_SOL: u64 = 50;
+/// Ratios are kept in basis points (10_000 = 1x) so Config stays Eq.
+pub const RATIO_ONE_BPS: u64 = 10_000;
+pub const HARD_MAX_RATIO_BPS: u64 = 5 * RATIO_ONE_BPS;
+pub const DEFAULT_MIN_REQUIRED_SOL: u64 = 5;
+pub const DEFAULT_MAX_TOPUP_SOL: u64 = 10;
+pub const DEFAULT_TRIGGER_RATIO: f64 = 1.5;
+pub const DEFAULT_TARGET_RATIO: f64 = 2.0;
+pub const DEFAULT_BOND_API_URL: &str = "https://api.jpool.one/allocation/validators";
 /// The identity pays vote fees; never let a top-up drain it below this.
 pub const HARD_MIN_IDENTITY_RESERVE_SOL: u64 = 1;
 /// 1 lamport per compute unit at most; keeps the fee buffer bounded.
@@ -26,8 +34,16 @@ pub struct Config {
     pub identity_pubkey: Pubkey,
     pub identity_keypair_path: PathBuf,
     pub bond_name: String,
-    pub min_value_lamports: u64,
-    pub topup_lamports: u64,
+    /// JPool's bond API base; the requirement is read from
+    /// `{bond_api_url}/{vote}/bond` (security_required + perf_required).
+    pub bond_api_url: String,
+    /// The requirement never counts as less than this.
+    pub min_required_lamports: u64,
+    /// Top up when the bond value is below trigger x required ...
+    pub trigger_ratio_bps: u64,
+    /// ... to target x required, at most max_topup per run.
+    pub target_ratio_bps: u64,
+    pub max_topup_lamports: u64,
     pub identity_reserve_lamports: u64,
     pub priority_fee_micro_lamports: u64,
     pub metrics_file: PathBuf,
@@ -42,8 +58,11 @@ impl fmt::Debug for Config {
             .field("identity_pubkey", &self.identity_pubkey)
             .field("identity_keypair_path", &self.identity_keypair_path)
             .field("bond_name", &self.bond_name)
-            .field("min_value_lamports", &self.min_value_lamports)
-            .field("topup_lamports", &self.topup_lamports)
+            .field("bond_api_url", &self.bond_api_url)
+            .field("min_required_lamports", &self.min_required_lamports)
+            .field("trigger_ratio_bps", &self.trigger_ratio_bps)
+            .field("target_ratio_bps", &self.target_ratio_bps)
+            .field("max_topup_lamports", &self.max_topup_lamports)
             .field("identity_reserve_lamports", &self.identity_reserve_lamports)
             .field(
                 "priority_fee_micro_lamports",
@@ -91,8 +110,16 @@ struct RawConfig {
     identity_keypair_path: PathBuf,
     #[serde(default = "default_bond_name")]
     bond_name: String,
-    min_value_sol: SolAmount,
-    topup_sol: SolAmount,
+    #[serde(default = "default_bond_api_url")]
+    bond_api_url: String,
+    #[serde(default = "default_min_required")]
+    min_required_sol: SolAmount,
+    #[serde(default = "default_trigger_ratio")]
+    trigger_ratio: f64,
+    #[serde(default = "default_target_ratio")]
+    target_ratio: f64,
+    #[serde(default = "default_max_topup")]
+    max_topup_sol: SolAmount,
     #[serde(default = "default_identity_reserve")]
     identity_reserve_sol: SolAmount,
     priority_fee_micro_lamports: u64,
@@ -101,6 +128,36 @@ struct RawConfig {
 
 fn default_bond_name() -> String {
     DEFAULT_BOND_NAME.to_string()
+}
+
+fn default_bond_api_url() -> String {
+    DEFAULT_BOND_API_URL.to_string()
+}
+
+const fn default_min_required() -> SolAmount {
+    SolAmount::Integer(DEFAULT_MIN_REQUIRED_SOL)
+}
+
+const fn default_trigger_ratio() -> f64 {
+    DEFAULT_TRIGGER_RATIO
+}
+
+const fn default_target_ratio() -> f64 {
+    DEFAULT_TARGET_RATIO
+}
+
+const fn default_max_topup() -> SolAmount {
+    SolAmount::Integer(DEFAULT_MAX_TOPUP_SOL)
+}
+
+fn ratio_bps(field: &str, ratio: f64) -> Result<u64> {
+    if !ratio.is_finite() || ratio <= 0.0 || ratio > (HARD_MAX_RATIO_BPS / RATIO_ONE_BPS) as f64 {
+        bail!(
+            "{field} must be in (0, {}], got {ratio}",
+            HARD_MAX_RATIO_BPS / RATIO_ONE_BPS
+        );
+    }
+    Ok((ratio * RATIO_ONE_BPS as f64).round() as u64)
 }
 
 const fn default_identity_reserve() -> SolAmount {
@@ -152,8 +209,11 @@ impl Config {
                 .context("invalid identity_pubkey")?,
             identity_keypair_path: raw.identity_keypair_path,
             bond_name: raw.bond_name,
-            min_value_lamports: raw.min_value_sol.to_lamports("min_value_sol")?,
-            topup_lamports: raw.topup_sol.to_lamports("topup_sol")?,
+            bond_api_url: raw.bond_api_url,
+            min_required_lamports: raw.min_required_sol.to_lamports("min_required_sol")?,
+            trigger_ratio_bps: ratio_bps("trigger_ratio", raw.trigger_ratio)?,
+            target_ratio_bps: ratio_bps("target_ratio", raw.target_ratio)?,
+            max_topup_lamports: raw.max_topup_sol.to_lamports("max_topup_sol")?,
             identity_reserve_lamports: raw
                 .identity_reserve_sol
                 .to_lamports("identity_reserve_sol")?,
@@ -181,18 +241,34 @@ impl Config {
                 self.bond_name.len()
             );
         }
-        if self.topup_lamports == 0 || self.topup_lamports > HARD_MAX_TOPUP_SOL * LAMPORTS_PER_SOL {
-            bail!(
-                "topup_sol must be in (0, {HARD_MAX_TOPUP_SOL}], got {}",
-                format_sol(self.topup_lamports)
-            );
+        if !self.bond_api_url.starts_with("https://") {
+            bail!("bond_api_url must be an https URL");
         }
-        if self.min_value_lamports == 0
-            || self.min_value_lamports > HARD_MAX_MIN_VALUE_SOL * LAMPORTS_PER_SOL
+        if self.max_topup_lamports == 0
+            || self.max_topup_lamports > HARD_MAX_TOPUP_SOL * LAMPORTS_PER_SOL
         {
             bail!(
-                "min_value_sol must be in (0, {HARD_MAX_MIN_VALUE_SOL}], got {}",
-                format_sol(self.min_value_lamports)
+                "max_topup_sol must be in (0, {HARD_MAX_TOPUP_SOL}], got {}",
+                format_sol(self.max_topup_lamports)
+            );
+        }
+        if self.min_required_lamports == 0
+            || self.min_required_lamports > HARD_MAX_MIN_REQUIRED_SOL * LAMPORTS_PER_SOL
+        {
+            bail!(
+                "min_required_sol must be in (0, {HARD_MAX_MIN_REQUIRED_SOL}], got {}",
+                format_sol(self.min_required_lamports)
+            );
+        }
+        if self.trigger_ratio_bps < RATIO_ONE_BPS
+            || self.target_ratio_bps < self.trigger_ratio_bps
+            || self.target_ratio_bps > HARD_MAX_RATIO_BPS
+        {
+            bail!(
+                "need 1 <= trigger_ratio <= target_ratio <= {}, got {} and {}",
+                HARD_MAX_RATIO_BPS / RATIO_ONE_BPS,
+                self.trigger_ratio_bps as f64 / RATIO_ONE_BPS as f64,
+                self.target_ratio_bps as f64 / RATIO_ONE_BPS as f64
             );
         }
         if self.identity_reserve_lamports < HARD_MIN_IDENTITY_RESERVE_SOL * LAMPORTS_PER_SOL {
@@ -264,8 +340,7 @@ rpc_url = "https://rpc.example.test"
 vote_account = "steakxfubt37xYdvuXz7BV5Uhhhk1FyJx9zGHfDcTVr"
 identity_pubkey = "EUDis6LJeJzDHTEBgfHGQyjHp63XZkGkx4E69xunC2Ej"
 identity_keypair_path = "/secure/identity.json"
-min_value_sol = 8
-topup_sol = 5
+max_topup_sol = 10
 priority_fee_micro_lamports = 1000
 metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
 "#;
@@ -280,15 +355,18 @@ metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
     fn applies_defaults() {
         let config = load(VALID).expect("valid config");
         assert_eq!(config.bond_name, "perf");
-        assert_eq!(config.min_value_lamports, 8 * LAMPORTS_PER_SOL);
-        assert_eq!(config.topup_lamports, 5 * LAMPORTS_PER_SOL);
+        assert_eq!(config.bond_api_url, DEFAULT_BOND_API_URL);
+        assert_eq!(config.min_required_lamports, 5 * LAMPORTS_PER_SOL);
+        assert_eq!(config.trigger_ratio_bps, 15_000);
+        assert_eq!(config.target_ratio_bps, 20_000);
+        assert_eq!(config.max_topup_lamports, 10 * LAMPORTS_PER_SOL);
         assert_eq!(config.identity_reserve_lamports, 10 * LAMPORTS_PER_SOL);
     }
 
     #[test]
     fn accepts_decimal_sol_amounts() {
-        let config = load(&VALID.replace("topup_sol = 5", "topup_sol = 2.5")).unwrap();
-        assert_eq!(config.topup_lamports, 2_500_000_000);
+        let config = load(&VALID.replace("max_topup_sol = 10", "max_topup_sol = 2.5")).unwrap();
+        assert_eq!(config.max_topup_lamports, 2_500_000_000);
     }
 
     #[test]
@@ -301,10 +379,32 @@ metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
     #[test]
     fn enforces_hard_caps() {
         for (from, to) in [
-            ("topup_sol = 5", "topup_sol = 10.000000001"),
-            ("topup_sol = 5", "topup_sol = 0"),
-            ("min_value_sol = 8", "min_value_sol = 51"),
-            ("min_value_sol = 8", "min_value_sol = -1.0"),
+            ("max_topup_sol = 10", "max_topup_sol = 10.000000001"),
+            ("max_topup_sol = 10", "max_topup_sol = 0"),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\nmin_required_sol = 51",
+            ),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\nmin_required_sol = -1.0",
+            ),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\ntrigger_ratio = 0.9",
+            ),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\ntrigger_ratio = 2.5",
+            ),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\ntarget_ratio = 5.5",
+            ),
+            (
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\nbond_api_url = \"http://api.jpool.one\"",
+            ),
             (
                 "priority_fee_micro_lamports = 1000",
                 "priority_fee_micro_lamports = 1000001",
@@ -314,8 +414,20 @@ metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
             let invalid = VALID.replace(from, to);
             assert!(load(&invalid).is_err(), "accepted {to}");
         }
-        assert!(load(&VALID.replace("topup_sol = 5", "topup_sol = 10")).is_ok());
-        assert!(load(&VALID.replace("min_value_sol = 8", "min_value_sol = 50")).is_ok());
+        assert!(
+            load(&VALID.replace(
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\nmin_required_sol = 50"
+            ))
+            .is_ok()
+        );
+        assert!(
+            load(&VALID.replace(
+                "max_topup_sol = 10",
+                "max_topup_sol = 10\ntrigger_ratio = 1\ntarget_ratio = 5"
+            ))
+            .is_ok()
+        );
         assert!(load(&format!("{VALID}identity_reserve_sol = 0.5\n")).is_err());
     }
 
@@ -332,7 +444,7 @@ metrics_file = "/var/lib/alloy/textcollector/jpool_bond.prom"
         let secret = "https://rpc.example.test/?api-key=SECRETKEY";
         let broken = VALID
             .replace("https://rpc.example.test", secret)
-            .replace("topup_sol = 5", "topup_sol = \"five\"");
+            .replace("max_topup_sol = 10", "max_topup_sol = \"five\"");
         let error = format!("{:#}", load(&broken).expect_err("broken config"));
         assert!(!error.contains("SECRETKEY"), "{error}");
         let debug = format!(

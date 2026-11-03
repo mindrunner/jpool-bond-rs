@@ -83,6 +83,9 @@ pub struct ChainSnapshot {
 
 pub trait ChainDataSource {
     fn snapshot(&self, addresses: &Addresses) -> Result<ChainSnapshot>;
+    /// JPool's bond requirement for the vote account in lamports:
+    /// `security_required + perf_required` from its bond API.
+    fn bond_requirement(&self, addresses: &Addresses) -> Result<u64>;
     fn recent_identity_topup(
         &self,
         addresses: &Addresses,
@@ -92,6 +95,29 @@ pub trait ChainDataSource {
 
 pub struct RpcChainDataSource<'a> {
     pub client: &'a RpcClient,
+    /// Base of JPool's bond API (`Config::bond_api_url`).
+    pub bond_api_url: &'a str,
+}
+
+/// Reads `current.security_required + current.perf_required` from JPool's
+/// `/allocation/validators/{vote}/bond` response and checks the vote account.
+pub fn parse_bond_requirement(body: &serde_json::Value, vote_account: &Pubkey) -> Result<u64> {
+    let vote = body
+        .get("vote_account")
+        .and_then(|value| value.as_str())
+        .context("bond API response has no vote_account")?;
+    if vote != vote_account.to_string() {
+        bail!("bond API answered for vote account {vote}, not {vote_account}");
+    }
+    let field = |name: &str| -> Result<u64> {
+        body.get("current")
+            .and_then(|current| current.get(name))
+            .and_then(|value| value.as_u64())
+            .with_context(|| format!("bond API response has no current.{name}"))
+    };
+    field("security_required")?
+        .checked_add(field("perf_required")?)
+        .context("bond requirement overflows")
 }
 
 impl ChainDataSource for RpcChainDataSource<'_> {
@@ -162,6 +188,54 @@ impl ChainDataSource for RpcChainDataSource<'_> {
     ) -> Result<Option<RecentTopUp>> {
         history::find_recent_identity_topup(self.client, addresses, since_unix)
     }
+
+    fn bond_requirement(&self, addresses: &Addresses) -> Result<u64> {
+        let url = format!(
+            "{}/{}/bond",
+            self.bond_api_url.trim_end_matches('/'),
+            addresses.vote_account
+        );
+        let body: serde_json::Value = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .build()
+            .context("failed to build the bond API client")?
+            .get(&url)
+            .send()
+            .and_then(|response| response.error_for_status())
+            .with_context(|| format!("bond API request {url} failed"))?
+            .json()
+            .with_context(|| format!("bond API response from {url} is not JSON"))?;
+        parse_bond_requirement(&body, &addresses.vote_account)
+    }
+}
+
+/// Bond sizing for one run: required = max(JPool's requirement, the
+/// configured minimum); top up below trigger x required to target x required.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizing {
+    pub api_required_lamports: u64,
+    pub required_lamports: u64,
+    pub threshold_lamports: u64,
+    pub target_lamports: u64,
+}
+
+pub fn sizing(config: &Config, api_required_lamports: u64) -> Result<Sizing> {
+    let required = api_required_lamports.max(config.min_required_lamports);
+    let scale = |bps: u64| -> Result<u64> {
+        u64::try_from(
+            (required as u128)
+                .checked_mul(bps as u128)
+                .context("bond sizing overflows")?
+                / config::RATIO_ONE_BPS as u128,
+        )
+        .context("bond sizing overflows")
+    };
+    Ok(Sizing {
+        api_required_lamports,
+        required_lamports: required,
+        threshold_lamports: scale(config.trigger_ratio_bps)?,
+        target_lamports: scale(config.target_ratio_bps)?,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -194,8 +268,11 @@ pub struct Assessment {
     pub jsol_sol_rate: f64,
     pub bond_jsol: u64,
     pub bond_value_lamports: u64,
+    /// Bond value below which a top-up runs (trigger x required).
     pub min_value_lamports: u64,
+    /// What this run would deposit: target minus value, capped; 0 above the floor.
     pub topup_lamports: u64,
+    pub sizing: Sizing,
     pub identity_lamports: u64,
     pub identity_jsol: Option<u64>,
     pub decision: Decision,
@@ -223,6 +300,7 @@ pub fn assess(
     config: &Config,
     addresses: &Addresses,
     snapshot: &ChainSnapshot,
+    sizing: &Sizing,
 ) -> Result<Assessment> {
     config.validate()?;
     if *addresses != Addresses::derive(config) {
@@ -332,16 +410,22 @@ pub fn assess(
         jsol_sol_rate: pool.rate(),
         bond_jsol,
         bond_value_lamports,
-        min_value_lamports: config.min_value_lamports,
-        topup_lamports: config.topup_lamports,
+        min_value_lamports: sizing.threshold_lamports,
+        topup_lamports: 0,
+        sizing: *sizing,
         identity_lamports: snapshot.identity_lamports,
         identity_jsol,
         decision: Decision::NoTopUp,
         blocked_topup: None,
     };
-    if bond_value_lamports >= config.min_value_lamports {
+    if bond_value_lamports >= sizing.threshold_lamports {
         return Ok(assessment);
     }
+    let topup_lamports = sizing
+        .target_lamports
+        .saturating_sub(bond_value_lamports)
+        .min(config.max_topup_lamports);
+    assessment.topup_lamports = topup_lamports;
 
     if assessment.bond_state.status != BondStatus::Active {
         assessment.decision = Decision::Refused(format!(
@@ -358,7 +442,7 @@ pub fn assess(
         ));
         return Ok(assessment);
     }
-    let quote = pool.deposit_sol_quote(config.topup_lamports)?;
+    let quote = pool.deposit_sol_quote(topup_lamports)?;
     let ata_rent_lamports = if snapshot.identity_token_account.is_some() {
         0
     } else {
@@ -367,8 +451,7 @@ pub fn assess(
             .context("identity JSOL account is missing and no rent estimate was fetched")?
     };
     let fee_buffer = fee_buffer_lamports(config.priority_fee_micro_lamports)?;
-    let required = config
-        .topup_lamports
+    let required = topup_lamports
         .checked_add(config.identity_reserve_lamports)
         .and_then(|amount| amount.checked_add(fee_buffer))
         .and_then(|amount| amount.checked_add(ata_rent_lamports))
@@ -378,7 +461,7 @@ pub fn assess(
             "identity {} balance {} SOL is below top-up {} + reserve {} + fee buffer {} + ATA rent {} = {} SOL",
             addresses.identity,
             format_sol(snapshot.identity_lamports),
-            format_sol(config.topup_lamports),
+            format_sol(topup_lamports),
             format_sol(config.identity_reserve_lamports),
             format_sol(fee_buffer),
             format_sol(ata_rent_lamports),
@@ -397,7 +480,7 @@ pub fn assess(
         deposit_sol_instruction(
             &addresses.identity,
             &addresses.identity_token_account,
-            config.topup_lamports,
+            topup_lamports,
         ),
         bond_top_up_token_instruction(
             addresses.bond_state,
@@ -425,7 +508,8 @@ pub fn plan<S: ChainDataSource>(source: &S, config: &Config, now_unix: i64) -> R
     config.validate()?;
     let addresses = Addresses::derive(config);
     let snapshot = source.snapshot(&addresses)?;
-    let mut assessment = assess(config, &addresses, &snapshot)?;
+    let sizing = sizing(config, source.bond_requirement(&addresses)?)?;
+    let mut assessment = assess(config, &addresses, &snapshot, &sizing)?;
     if matches!(assessment.decision, Decision::TopUp(_)) {
         let since = now_unix - TOPUP_COOLDOWN_SECONDS;
         if let Some(recent) = source.recent_identity_topup(&addresses, since)? {
@@ -499,6 +583,13 @@ pub fn render_assessment(assessment: &Assessment) -> String {
             format_base_units(a.bond_jsol),
             format_sol(a.bond_value_lamports),
             format_sol(a.min_value_lamports)
+        ),
+        format!(
+            "requirement:        {} SOL (JPool {} SOL, minimum applied if higher); top up below {} SOL to {} SOL",
+            format_sol(a.sizing.required_lamports),
+            format_sol(a.sizing.api_required_lamports),
+            format_sol(a.sizing.threshold_lamports),
+            format_sol(a.sizing.target_lamports)
         ),
         format!(
             "identity:           {} balance {} SOL, JSOL account {} ({})",

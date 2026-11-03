@@ -129,6 +129,10 @@ impl ChainDataSource for StaticSource {
     ) -> Result<Option<RecentTopUp>> {
         Ok(self.recent.clone())
     }
+
+    fn bond_requirement(&self, _addresses: &Addresses) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 #[derive(Default)]
@@ -171,8 +175,13 @@ fn fixture(min_value_sol: u64, keypair: Option<&Keypair>) -> Fixture {
         identity_pubkey: identity,
         identity_keypair_path: keypair_path,
         bond_name: "perf".into(),
-        min_value_lamports: min_value_sol * LAMPORTS_PER_SOL,
-        topup_lamports: 5 * LAMPORTS_PER_SOL,
+        bond_api_url: jpool_bond_rs::config::DEFAULT_BOND_API_URL.into(),
+        // Legacy-equivalent sizing: floor = minimum requirement (trigger 1x),
+        // every top-up is the 5 SOL cap.
+        min_required_lamports: min_value_sol * LAMPORTS_PER_SOL,
+        trigger_ratio_bps: jpool_bond_rs::config::RATIO_ONE_BPS,
+        target_ratio_bps: jpool_bond_rs::config::HARD_MAX_RATIO_BPS,
+        max_topup_lamports: 5 * LAMPORTS_PER_SOL,
         identity_reserve_lamports: 10 * LAMPORTS_PER_SOL,
         priority_fee_micro_lamports: 1_000,
         metrics_file: dir.path().join("jpool_bond.prom"),
