@@ -22,9 +22,53 @@ fn parses_explicit_plan_and_run_commands() {
             Command::Plan { config } | Command::Run { config } => {
                 assert_eq!(config, PathBuf::from("/etc/jpool/config.toml"));
             }
+            Command::Withdraw { .. } => unreachable!("parsed plan/run"),
         }
     }
     assert!(Cli::try_parse_from(["jpool-bond-rs", "--config", "/etc/jpool/config.toml"]).is_err());
+}
+
+#[test]
+fn parses_withdraw_with_required_identity_and_amount() {
+    let cli = Cli::try_parse_from([
+        "jpool-bond-rs",
+        "withdraw",
+        "--config",
+        "/etc/jpool/config.toml",
+        "--identity-keypair",
+        "/keys/v1.json",
+        "--sol",
+        "7.5",
+        "--dry-run",
+    ])
+    .expect("parse withdraw");
+    match cli.command {
+        Command::Withdraw {
+            identity_keypair,
+            sol,
+            destination,
+            dry_run,
+            ..
+        } => {
+            assert_eq!(identity_keypair, PathBuf::from("/keys/v1.json"));
+            assert_eq!(sol, "7.5");
+            assert_eq!(destination, None);
+            assert!(dry_run);
+        }
+        other => panic!("unexpected command {other:?}"),
+    }
+    assert!(
+        Cli::try_parse_from([
+            "jpool-bond-rs",
+            "withdraw",
+            "--config",
+            "/c.toml",
+            "--sol",
+            "1"
+        ])
+        .is_err(),
+        "the identity keypair is required"
+    );
 }
 
 fn account(owner: Pubkey, data: &[u8]) -> ChainAccount {

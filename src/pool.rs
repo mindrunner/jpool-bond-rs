@@ -55,6 +55,15 @@ impl JPool {
         u64::try_from(value).map_err(|_| anyhow::anyhow!("JSOL value overflow"))
     }
 
+    /// JSOL worth `lamports` at the pool rate, rounded down.
+    pub fn lamports_to_jsol(&self, lamports: u64) -> Result<u64> {
+        let value = (lamports as u128)
+            .checked_mul(self.pool.pool_token_supply as u128)
+            .ok_or_else(|| anyhow::anyhow!("JSOL amount overflow"))?
+            / self.pool.total_lamports as u128;
+        u64::try_from(value).map_err(|_| anyhow::anyhow!("JSOL amount overflow"))
+    }
+
     pub fn rate(&self) -> f64 {
         self.pool.total_lamports as f64 / self.pool.pool_token_supply as f64
     }
@@ -190,6 +199,29 @@ pub fn deposit_sol_instruction(
         &JSOL_MINT,
         &token_program_id(),
         lamports,
+    )
+}
+
+/// WithdrawSol: burns `jsol` from `source` (held by `authority`) and pays
+/// the SOL from the pool reserve to `lamports_to`.
+pub fn withdraw_sol_instruction(
+    authority: &Pubkey,
+    source: &Pubkey,
+    lamports_to: &Pubkey,
+    jsol: u64,
+) -> Instruction {
+    spl_stake_pool::instruction::withdraw_sol(
+        &STAKE_POOL_PROGRAM_ID,
+        &JPOOL_STAKE_POOL,
+        &withdraw_authority(),
+        authority,
+        source,
+        &JPOOL_RESERVE_STAKE,
+        lamports_to,
+        &JPOOL_MANAGER_FEE_ACCOUNT,
+        &JSOL_MINT,
+        &token_program_id(),
+        jsol,
     )
 }
 

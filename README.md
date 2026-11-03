@@ -145,3 +145,20 @@ Push a `v*` tag. The release workflow builds
 ## License
 
 Apache-2.0.
+
+## Manual withdrawal
+
+`withdraw` takes SOL worth of JSOL out of the bond and pays it out as SOL in
+one transaction: `bond_withdraw` moves the JSOL to the identity's JSOL account,
+then the JPool stake pool's `WithdrawSol` sends the SOL to `--destination`
+(default: the config's funding wallet). The validator identity signs; the
+bond program accepts it as withdrawal authority while none is set on the
+validator bond (the command refuses otherwise). Account order follows the
+program's on-chain Anchor IDL. It writes no metrics.
+
+```bash
+jpool-bond-rs withdraw --config config.toml --identity-keypair identity.json --sol 7.5 --dry-run
+jpool-bond-rs withdraw --config config.toml --identity-keypair identity.json --sol 7.5
+```
+
+`--dry-run` simulates the unsigned transaction and never loads the key.

@@ -16,6 +16,7 @@ pub const STANDARD_BOND_SEED: &[u8] = b"standard";
 pub const BOND_STATE_DISCRIMINATOR: [u8; 8] = [251, 95, 76, 47, 191, 108, 163, 92];
 pub const VALIDATOR_BOND_DISCRIMINATOR: [u8; 8] = [82, 127, 243, 208, 195, 42, 80, 35];
 pub const BOND_TOP_UP_DISCRIMINATOR: [u8; 8] = [132, 225, 254, 187, 152, 162, 176, 66];
+pub const BOND_WITHDRAW_DISCRIMINATOR: [u8; 8] = [99, 64, 127, 178, 53, 117, 70, 204];
 
 pub fn find_bond_state_address(bond_name: &str) -> Pubkey {
     Pubkey::find_program_address(
@@ -273,6 +274,41 @@ pub fn bond_top_up_token_instruction(
             AccountMeta::new(validator_bond, false),
             AccountMeta::new(payer, true),
             AccountMeta::new(payer_token_account, false),
+            AccountMeta::new(bond_token_account, false),
+            // stake_account: None
+            AccountMeta::new_readonly(BOND_PROGRAM_ID, false),
+            AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+            AccountMeta::new_readonly(token_program_id(), false),
+            // stake_program: None
+            AccountMeta::new_readonly(BOND_PROGRAM_ID, false),
+        ],
+        data,
+    }
+}
+
+/// Accounts for `bond_withdraw` with token collateral, in the order of the
+/// program's on-chain Anchor IDL: the JSOL goes from the bond's token account
+/// to `destination_token_account`. `authority` is the validator identity (or
+/// the bond's withdrawal authority, when one is set).
+pub fn bond_withdraw_token_instruction(
+    bond_state: Pubkey,
+    validator_bond: Pubkey,
+    authority: Pubkey,
+    destination_token_account: Pubkey,
+    bond_token_account: Pubkey,
+    amount: u64,
+) -> Instruction {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&BOND_WITHDRAW_DISCRIMINATOR);
+    data.extend_from_slice(&amount.to_le_bytes());
+    Instruction {
+        program_id: BOND_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(bond_state, false),
+            AccountMeta::new(validator_bond, false),
+            AccountMeta::new(authority, true),
+            AccountMeta::new(authority, false),
+            AccountMeta::new(destination_token_account, false),
             AccountMeta::new(bond_token_account, false),
             // stake_account: None
             AccountMeta::new_readonly(BOND_PROGRAM_ID, false),

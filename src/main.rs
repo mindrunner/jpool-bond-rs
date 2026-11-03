@@ -1,4 +1,5 @@
 use anyhow::Result;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use jpool_bond_rs::{
     Addresses, Assessment, ChainDataSource, Decision, MAX_ATTEMPTS, RpcChainDataSource,
@@ -7,12 +8,17 @@ use jpool_bond_rs::{
     plan, render_assessment,
     transaction::submit_with_backend,
     verify_topup,
+    withdraw::{parse_sol, plan_withdraw},
 };
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_instruction::Instruction;
 use solana_keypair::{Keypair, read_keypair_file};
+use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_signer::Signer;
+use solana_transaction::Transaction;
+use std::str::FromStr;
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,
@@ -37,6 +43,24 @@ enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Manual: withdraw SOL worth of JSOL from the bond and pay it out as SOL
+    /// (JSOL WithdrawSol) to --destination, signed by the validator identity.
+    /// Writes no metrics. --dry-run simulates unsigned and never loads the key.
+    Withdraw {
+        #[arg(long)]
+        config: PathBuf,
+        /// Validator identity keypair (the bond's withdrawal authority).
+        #[arg(long)]
+        identity_keypair: PathBuf,
+        /// SOL value to withdraw, at the JSOL pool rate (e.g. 7.5).
+        #[arg(long)]
+        sol: String,
+        /// Where the SOL goes; defaults to the config's funding wallet.
+        #[arg(long)]
+        destination: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -94,6 +118,21 @@ fn run_cli<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
     let (config_path, mode) = match &cli.command {
         Command::Plan { config } => (config.as_path(), Mode::Plan),
         Command::Run { config } => (config.as_path(), Mode::Run),
+        Command::Withdraw {
+            config,
+            identity_keypair,
+            sol,
+            destination,
+            dry_run,
+        } => {
+            return run_withdraw(
+                config,
+                identity_keypair,
+                sol,
+                destination.as_deref(),
+                *dry_run,
+            );
+        }
     };
     let config = load_config(config_path, sink)?;
     // The default finalized commitment rejects confirmed blockhashes.
@@ -109,6 +148,106 @@ fn run_cli<S: MetricsSink>(cli: Cli, sink: &S) -> Result<()> {
     // Client errors can quote the request URL, which carries the API key.
     execute(mode, &config, sink, &source, &executor, now_seconds())
         .map_err(|error| anyhow::anyhow!(redact_rpc_url(&format!("{error:#}"), &config.rpc_url)))
+}
+
+fn run_withdraw(
+    config_path: &Path,
+    identity_keypair: &Path,
+    sol: &str,
+    destination: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let lamports = parse_sol(sol)?;
+    let destination = match destination {
+        Some(value) => Pubkey::from_str(value).context("invalid --destination")?,
+        None => config.identity_pubkey,
+    };
+    let client = RpcClient::new_with_commitment(
+        config.rpc_url.clone(),
+        solana_commitment_config::CommitmentConfig::confirmed(),
+    );
+    let result = (|| -> Result<()> {
+        let addresses = Addresses::derive(&config);
+        let snapshot = RpcChainDataSource { client: &client }.snapshot(&addresses)?;
+        // Dry runs take the identity from the bond itself, so they never need
+        // the key; real runs check the key against it in plan_withdraw.
+        let keypair = if dry_run {
+            None
+        } else {
+            Some(
+                read_keypair_file(identity_keypair)
+                    .map_err(|error| anyhow::anyhow!("failed to read identity keypair: {error}"))?,
+            )
+        };
+        let identity = match &keypair {
+            Some(keypair) => keypair.pubkey(),
+            None => {
+                let account = snapshot
+                    .validator_bond
+                    .as_ref()
+                    .context("validator bond does not exist")?;
+                jpool_bond_rs::bond::decode_validator_bond(&addresses.validator_bond, account)?
+                    .identity
+            }
+        };
+        let plan = plan_withdraw(&addresses, &snapshot, identity, lamports, destination)?;
+        println!("identity:           {}", plan.identity);
+        println!("destination:        {}", plan.destination);
+        println!(
+            "bond:               {} JSOL before, withdraw {} JSOL (~{} SOL at the pool rate)",
+            format_base_units(plan.bond_jsol_before),
+            format_base_units(plan.withdraw_jsol),
+            format_sol(plan.withdraw_value_lamports)
+        );
+        println!(
+            "bond after:         ~{} SOL (floor {} SOL)",
+            format_sol(plan.bond_value_after_lamports),
+            format_sol(config.min_value_lamports)
+        );
+        match keypair {
+            None => {
+                let transaction =
+                    Transaction::new_with_payer(&plan.instructions, Some(&plan.identity));
+                let simulation = client
+                    .simulate_transaction_with_config(
+                        &transaction,
+                        RpcSimulateTransactionConfig {
+                            sig_verify: false,
+                            replace_recent_blockhash: true,
+                            commitment: Some(
+                                solana_commitment_config::CommitmentConfig::confirmed(),
+                            ),
+                            ..RpcSimulateTransactionConfig::default()
+                        },
+                    )
+                    .context("simulation request failed")?
+                    .value;
+                if let Some(error) = simulation.err {
+                    bail!(
+                        "simulation failed: {error:?}; logs: {:?}",
+                        simulation.logs.unwrap_or_default()
+                    );
+                }
+                println!(
+                    "dry run:            simulation ok ({} compute units), nothing signed or sent",
+                    simulation.units_consumed.unwrap_or_default()
+                );
+            }
+            Some(keypair) => {
+                let signature = submit_with_backend(
+                    &client,
+                    &keypair,
+                    &plan.instructions,
+                    config.priority_fee_micro_lamports,
+                    MAX_ATTEMPTS,
+                )?;
+                println!("withdrawn:          {signature}");
+            }
+        }
+        Ok(())
+    })();
+    result.map_err(|error| anyhow::anyhow!(redact_rpc_url(&format!("{error:#}"), &config.rpc_url)))
 }
 
 fn load_config<S: MetricsSink>(path: &Path, sink: &S) -> Result<Config> {
